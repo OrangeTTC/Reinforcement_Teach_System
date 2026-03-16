@@ -488,6 +488,7 @@ class ThreeDWindow(QMainWindow):
             "HER": 0.0,
         }
         self._run_counter = 0
+        self._metrics_history: list[dict[str, object]] = []
 
         metrics_bar = QWidget()
         metrics_layout = QVBoxLayout(metrics_bar)
@@ -500,6 +501,8 @@ class ThreeDWindow(QMainWindow):
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setMinimumHeight(170)
         self.metrics_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.metrics_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.metrics_table.setSelectionMode(QTableWidget.SingleSelection)
 
         hdr = self.metrics_table.horizontalHeader()
         hdr.setStretchLastSection(False)
@@ -512,7 +515,13 @@ class ThreeDWindow(QMainWindow):
         def fmt_metric(v: float) -> str:
             return f"{float(v):.3f}"
 
-        def append_metric_log(algo_name: str, training_time: float, navigate_length: float, navigate_time: float) -> None:
+        def append_metric_log(
+            algo_name: str,
+            training_time: float,
+            navigate_length: float,
+            navigate_time: float,
+            path: list[tuple[float, float, float]] | None = None,
+        ) -> None:
             self._run_counter += 1
             row = self.metrics_table.rowCount()
             self.metrics_table.insertRow(row)
@@ -521,9 +530,64 @@ class ThreeDWindow(QMainWindow):
             self.metrics_table.setItem(row, 2, QTableWidgetItem(fmt_metric(training_time)))
             self.metrics_table.setItem(row, 3, QTableWidgetItem(fmt_metric(navigate_length)))
             self.metrics_table.setItem(row, 4, QTableWidgetItem(fmt_metric(navigate_time)))
+            self._metrics_history.append(
+                {
+                    "run": self._run_counter,
+                    "algorithm": algo_name,
+                    "training_time": float(training_time),
+                    "navigate_length": float(navigate_length),
+                    "navigate_time": float(navigate_time),
+                    "path": list(path) if path else [],
+                }
+            )
             self.metrics_table.scrollToBottom()
 
+        def on_metrics_row_clicked(row: int, _column: int) -> None:
+            if row < 0 or row >= len(self._metrics_history):
+                self.trace_status.setText("Invalid history row")
+                return
+
+            item = self._metrics_history[row]
+            path = list(item.get("path", []))
+            if not path:
+                self.trace_status.setText("No trajectory recorded for this run")
+                return
+
+            if self._gl.replay_navigation_path(path):
+                algo_name = str(item.get("algorithm", "Unknown"))
+                run_no = int(item.get("run", 0))
+                self.trace_status.setText(f"Replaying run {run_no} ({algo_name})")
+            else:
+                self.trace_status.setText("Replay failed for selected run")
+
+        def on_delete_selected_history() -> None:
+            row = self.metrics_table.currentRow()
+            if row < 0 or row >= self.metrics_table.rowCount():
+                self.trace_status.setText("Select a history row to delete")
+                return
+
+            self.metrics_table.removeRow(row)
+            if 0 <= row < len(self._metrics_history):
+                self._metrics_history.pop(row)
+            self.trace_status.setText("Selected history deleted")
+
+        def on_clear_history() -> None:
+            self.metrics_table.setRowCount(0)
+            self._metrics_history.clear()
+            self.trace_status.setText("All history cleared")
+
         metrics_layout.addWidget(self.metrics_table)
+
+        metrics_btn_row = QWidget()
+        metrics_btn_layout = QHBoxLayout(metrics_btn_row)
+        metrics_btn_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_btn_layout.setSpacing(8)
+        self.delete_history_button = QPushButton("Delete Selected")
+        self.clear_history_button = QPushButton("Clear History")
+        metrics_btn_layout.addWidget(self.delete_history_button)
+        metrics_btn_layout.addWidget(self.clear_history_button)
+        metrics_btn_layout.addStretch(1)
+        metrics_layout.addWidget(metrics_btn_row)
 
         row_trace_actions = QWidget()
         row_trace_actions_layout = QVBoxLayout(row_trace_actions)
@@ -741,7 +805,8 @@ class ThreeDWindow(QMainWindow):
                 ok = self._gl.start_astar_navigation()
                 nav_elapsed = perf_counter() - t0
                 nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                append_metric_log(algo, 0.0, nav_length, float(nav_elapsed))
+                nav_path = self._gl.get_last_navigation_path() if ok else []
+                append_metric_log(algo, 0.0, nav_length, float(nav_elapsed), nav_path)
                 if ok:
                     pass
                 self.trace_status.setText("A* navigation started" if ok else "A* failed: set valid start/end and reachable path")
@@ -755,7 +820,8 @@ class ThreeDWindow(QMainWindow):
                 ok = self._gl.start_q_learning_navigation()
                 nav_elapsed = perf_counter() - t0
                 nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed))
+                nav_path = self._gl.get_last_navigation_path() if ok else []
+                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
                 if ok:
                     pass
                 self.trace_status.setText("Q-learning navigation started" if ok else "Q-learning failed: retrain or reset start/end")
@@ -769,7 +835,8 @@ class ThreeDWindow(QMainWindow):
                 ok = self._gl.start_dqn_navigation()
                 nav_elapsed = perf_counter() - t0
                 nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed))
+                nav_path = self._gl.get_last_navigation_path() if ok else []
+                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
                 self.trace_status.setText("DQN navigation started" if ok else "DQN failed: retrain or reset start/end")
                 return
 
@@ -781,7 +848,8 @@ class ThreeDWindow(QMainWindow):
                 ok = self._gl.start_ppo_navigation()
                 nav_elapsed = perf_counter() - t0
                 nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed))
+                nav_path = self._gl.get_last_navigation_path() if ok else []
+                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
                 self.trace_status.setText("PPO navigation started" if ok else "PPO failed: retrain or reset start/end")
                 return
 
@@ -793,7 +861,8 @@ class ThreeDWindow(QMainWindow):
                 ok = self._gl.start_her_navigation()
                 nav_elapsed = perf_counter() - t0
                 nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed))
+                nav_path = self._gl.get_last_navigation_path() if ok else []
+                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
                 self.trace_status.setText("HER navigation started" if ok else "HER failed: retrain or reset start/end")
                 return
 
@@ -817,6 +886,9 @@ class ThreeDWindow(QMainWindow):
         self.reset_agent_button.clicked.connect(on_reset_ball)
         self.navigate_button.clicked.connect(on_navigate)
         self.navigate_speed.valueChanged.connect(on_speed_changed)
+        self.metrics_table.cellClicked.connect(on_metrics_row_clicked)
+        self.delete_history_button.clicked.connect(on_delete_selected_history)
+        self.clear_history_button.clicked.connect(on_clear_history)
         self.undo_button.setEnabled(self._gl.can_undo_edit())
         update_shape_ui()
         update_navigation_ui()

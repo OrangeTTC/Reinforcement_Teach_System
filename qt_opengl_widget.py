@@ -483,6 +483,19 @@ class RotatingCubeWidget(QOpenGLWidget):
     def get_last_navigation_length(self) -> float:
         return float(self._nav_total_dist)
 
+    def get_last_navigation_path(self) -> list[tuple[float, float, float]]:
+        """Return a copy of the latest planned navigation path in map XYZ."""
+
+        return list(self._nav_path_map_xyz)
+
+    def replay_navigation_path(self, path: list[tuple[float, float, float]]) -> bool:
+        """Replay a previously recorded map-space path."""
+
+        if not path or len(path) < 2:
+            return False
+        # Copy path to avoid accidental external mutation during playback.
+        return self._set_navigation_path(list(path))
+
     def _path_length(self, planned: list[tuple[float, float, float]]) -> float:
         if not planned or len(planned) < 2:
             return 0.0
