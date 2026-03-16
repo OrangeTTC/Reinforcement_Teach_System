@@ -483,6 +483,83 @@ class RotatingCubeWidget(QOpenGLWidget):
     def get_last_navigation_length(self) -> float:
         return float(self._nav_total_dist)
 
+    def _path_length(self, planned: list[tuple[float, float, float]]) -> float:
+        if not planned or len(planned) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(1, len(planned)):
+            x0, y0, z0 = planned[i - 1]
+            x1, y1, z1 = planned[i]
+            total += math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
+        return total
+
+    def _line_of_sight_free_map(
+        self,
+        a: tuple[float, float, float],
+        b: tuple[float, float, float],
+    ) -> bool:
+        """Check straight-line traversability in map-space for occupancy terrain."""
+
+        if self._occupancy is None or self._occ_nx is None or self._occ_ny is None or self._occ_nz is None:
+            return True
+
+        nx, ny_h, nz = int(self._occ_nx), int(self._occ_ny), int(self._occ_nz)
+
+        ax = self._map_to_index(a[0], nx, "round")
+        ay_h = self._map_to_index(a[2], ny_h, "round")
+        az = self._map_to_index(a[1], nz, "round")
+
+        bx = self._map_to_index(b[0], nx, "round")
+        by_h = self._map_to_index(b[2], ny_h, "round")
+        bz = self._map_to_index(b[1], nz, "round")
+
+        if bool(self._occupancy[ax, ay_h, az]) or bool(self._occupancy[bx, by_h, bz]):
+            return False
+
+        dx = bx - ax
+        dy_h = by_h - ay_h
+        dz = bz - az
+        steps = max(abs(dx), abs(dy_h), abs(dz))
+        if steps <= 0:
+            return True
+
+        # Oversample slightly to reduce corner miss-through on coarse grids.
+        samples = max(2, steps * 2)
+        for s in range(samples + 1):
+            t = float(s) / float(samples)
+            ix = int(round(ax + dx * t))
+            iy_h = int(round(ay_h + dy_h * t))
+            iz = int(round(az + dz * t))
+            ix = max(0, min(nx - 1, ix))
+            iy_h = max(0, min(ny_h - 1, iy_h))
+            iz = max(0, min(nz - 1, iz))
+            if bool(self._occupancy[ix, iy_h, iz]):
+                return False
+        return True
+
+    def _optimize_rl_path(self, planned: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+        """Prune unnecessary RL waypoints while preserving obstacle safety."""
+
+        if not planned or len(planned) < 3:
+            return planned
+
+        pruned = [planned[0]]
+        i = 0
+        n = len(planned)
+        while i < n - 1:
+            j = n - 1
+            best = i + 1
+            while j > i + 1:
+                if self._line_of_sight_free_map(planned[i], planned[j]):
+                    best = j
+                    break
+                j -= 1
+            pruned.append(planned[best])
+            i = best
+
+        # Keep optimization only if it truly shortens trajectory.
+        return pruned if self._path_length(pruned) + 1e-6 < self._path_length(planned) else planned
+
     def _invalidate_q_learning(self) -> None:
         self._q_learning_trained = False
         self._q_learning_model = None
@@ -622,6 +699,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         )
         if not planned:
             return False
+        planned = self._optimize_rl_path(planned)
         return self._set_navigation_path(planned)
 
     def start_dqn_navigation(self) -> bool:
@@ -642,6 +720,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         )
         if not planned:
             return False
+        planned = self._optimize_rl_path(planned)
         return self._set_navigation_path(planned)
 
     def start_ppo_navigation(self) -> bool:
@@ -662,6 +741,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         )
         if not planned:
             return False
+        planned = self._optimize_rl_path(planned)
         return self._set_navigation_path(planned)
 
     def start_her_navigation(self) -> bool:
@@ -682,6 +762,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         )
         if not planned:
             return False
+        planned = self._optimize_rl_path(planned)
         return self._set_navigation_path(planned)
 
     def stop_navigation(self) -> None:
