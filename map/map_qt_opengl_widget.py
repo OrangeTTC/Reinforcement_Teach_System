@@ -17,10 +17,8 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QLabel
 
 from algorithm.algorithm_a_star import plan_astar_path_map_xyz
-from algorithm.algorithm_dqn import DQNModel, build_dqn_path, train_dqn_full_map
-from algorithm.algorithm_her import HERModel, build_her_path, train_her_full_map
-from algorithm.algorithm_ppo import PPOModel, build_ppo_path, train_ppo_full_map
-from algorithm.algorithm_q_learning import QLearningModel, build_q_learning_path, train_q_learning_full_map
+from algorithm.algorithm_q_learning import QLearningModel, train_q_learning_full_map
+from algorithm.algorithm_entrypoints import PATH_ENTRYPOINTS, TRAIN_ENTRYPOINTS
 from map.map_terrain_edit import (
     derive_heightfield_from_occupancy,
     export_occupancy_csv,
@@ -127,17 +125,10 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._nav_timer.setInterval(16)
         self._nav_timer.timeout.connect(self._on_nav_timer)
 
-        # Q-learning navigation state.
-        self._q_learning_trained = False
-        self._q_learning_model: QLearningModel | None = None
-
-        # Placeholders for other RL algorithms.
-        self._dqn_trained = False
-        self._dqn_model: DQNModel | None = None
-        self._ppo_trained = False
-        self._ppo_model: PPOModel | None = None
-        self._her_trained = False
-        self._her_model: HERModel | None = None
+        # Generic RL algorithm state — keyed by algorithm name string.
+        # Adding a new algorithm only requires an entry in algorithm_entrypoints.py.
+        self._rl_trained: dict[str, bool] = {name: False for name in TRAIN_ENTRYPOINTS}
+        self._rl_models: dict[str, Any] = {name: None for name in TRAIN_ENTRYPOINTS}
 
         self._start_label = QLabel(self)
         self._start_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -176,7 +167,7 @@ class RotatingCubeWidget(QOpenGLWidget):
 
         self._occupancy = self._undo_stack.pop()
         self._heights = self._derive_heightfield_from_occupancy(self._occupancy, self._cell_size)
-        self._invalidate_q_learning()
+        self._invalidate_rl_models()
         self._recompile_display_list_from_current_heights()
         self._emit_edit_state()
         return True
@@ -247,7 +238,7 @@ class RotatingCubeWidget(QOpenGLWidget):
             self._grid_ny = int(ny)
             self._cell_size = float(voxel_size)
             self._heights = self._derive_heightfield_from_occupancy(self._occupancy, self._cell_size)
-            self._invalidate_q_learning()
+            self._invalidate_rl_models()
             self._reset_edit_history()
             self._clear_pins()
             self._recompile_display_list_from_current_heights()
@@ -289,7 +280,7 @@ class RotatingCubeWidget(QOpenGLWidget):
             self._occ_nx = None
             self._occ_ny = None
             self._occ_nz = None
-            self._invalidate_q_learning()
+            self._invalidate_rl_models()
             self._reset_edit_history()
             self._clear_pins()
 
@@ -327,7 +318,7 @@ class RotatingCubeWidget(QOpenGLWidget):
 
     def clear_trace_points(self) -> None:
         self.stop_navigation()
-        self._invalidate_q_learning()
+        self._invalidate_rl_models()
         self._start_map_xyz = None
         self._end_map_xyz = None
         self._agent_map_xyz = None
@@ -441,7 +432,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._agent_map_xyz = start
         # Keep trained policy when only start changes; retraining is required only if end changes.
         if end_changed:
-            self._invalidate_q_learning()
+            self._invalidate_rl_models()
         self.stop_navigation()
         self._nav_path_map_xyz = []
         self._nav_path_cumdist = []
@@ -579,29 +570,17 @@ class RotatingCubeWidget(QOpenGLWidget):
         # Keep optimization only if it truly shortens trajectory.
         return pruned if self._path_length(pruned) + 1e-6 < self._path_length(planned) else planned
 
-    def _invalidate_q_learning(self) -> None:
-        self._q_learning_trained = False
-        self._q_learning_model = None
-        self._dqn_trained = False
-        self._dqn_model = None
-        self._ppo_trained = False
-        self._ppo_model = None
-        self._her_trained = False
-        self._her_model = None
+    def _invalidate_rl_models(self) -> None:
+        """Reset all RL model states (call when map or goal changes)."""
+        for name in list(self._rl_trained):
+            self._rl_trained[name] = False
+            self._rl_models[name] = None
 
     def is_algorithm_trained(self, algorithm: str) -> bool:
         algo = str(algorithm).strip()
         if algo == "A*":
             return True
-        if algo == "Q-learning":
-            return bool(self._q_learning_trained)
-        if algo == "DQN":
-            return bool(self._dqn_trained)
-        if algo == "PPO":
-            return bool(self._ppo_trained)
-        if algo == "HER":
-            return bool(self._her_trained)
-        return False
+        return bool(self._rl_trained.get(algo, False))
 
     def train_navigation_policy(
         self,
@@ -610,60 +589,25 @@ class RotatingCubeWidget(QOpenGLWidget):
     ) -> tuple[bool, str]:
         algo = str(algorithm).strip()
         if algo == "A*":
-            return (True, "A* does not require training")
-        if algo == "Q-learning":
-            if self._end_map_xyz is None:
-                self._invalidate_q_learning()
-                return (False, "Set End point before Q-learning training")
+            return (True, "A* 无需训练")
 
-            trained, model, episodes, free_cells, goal_idx = self._train_q_learning_full_map(progress_callback)
-            if not trained:
-                self._invalidate_q_learning()
-                return (False, "Q-learning training failed (invalid map or unreachable goal)")
+        train_fn = TRAIN_ENTRYPOINTS.get(algo)
+        if train_fn is None:
+            return (False, f"{algo} 未在 TRAIN_ENTRYPOINTS 中注册")
 
-            self._q_learning_model = model
-            self._q_learning_trained = True
+        if self._end_map_xyz is None:
+            return (False, f"请先设置终点再训练 {algo}")
 
-            gx, gy = goal_idx
-            return (True, f"Q-learning trained: episodes={episodes}, free={free_cells}, goal=({gx},{gy})")
-
-        if algo == "DQN":
-            ok, msg, model = train_dqn_full_map(
-                occupancy=self._occupancy,
-                heights=self._heights,
-                end_map_xyz=self._end_map_xyz,
-                map_to_index=self._map_to_index,
-                progress_callback=progress_callback,
-            )
-            self._dqn_trained = bool(ok)
-            self._dqn_model = model if ok else None
-            return (ok, msg)
-
-        if algo == "PPO":
-            ok, msg, model = train_ppo_full_map(
-                occupancy=self._occupancy,
-                heights=self._heights,
-                end_map_xyz=self._end_map_xyz,
-                map_to_index=self._map_to_index,
-                progress_callback=progress_callback,
-            )
-            self._ppo_trained = bool(ok)
-            self._ppo_model = model if ok else None
-            return (ok, msg)
-
-        if algo == "HER":
-            ok, msg, model = train_her_full_map(
-                occupancy=self._occupancy,
-                heights=self._heights,
-                end_map_xyz=self._end_map_xyz,
-                map_to_index=self._map_to_index,
-                progress_callback=progress_callback,
-            )
-            self._her_trained = bool(ok)
-            self._her_model = model if ok else None
-            return (ok, msg)
-
-        return (False, f"{algo} is unknown")
+        ok, msg, model = train_fn(
+            occupancy=self._occupancy,
+            heights=self._heights,
+            end_map_xyz=self._end_map_xyz,
+            map_to_index=self._map_to_index,
+            progress_callback=progress_callback,
+        )
+        self._rl_trained[algo] = bool(ok)
+        self._rl_models[algo] = model if ok else None
+        return (ok, msg)
 
     def _set_navigation_path(self, planned: list[tuple[float, float, float]]) -> bool:
         if not planned or len(planned) < 2:
@@ -688,93 +632,25 @@ class RotatingCubeWidget(QOpenGLWidget):
         self.update()
         return True
 
-    def _train_q_learning_full_map(
-        self,
-        progress_callback: Callable[[int], None] | None = None,
-    ) -> tuple[bool, QLearningModel | None, int, int, tuple[int, int]]:
-        return train_q_learning_full_map(
-            occupancy=self._occupancy,
-            heights=self._heights,
-            end_map_xyz=self._end_map_xyz,
-            map_to_index=self._map_to_index,
-            progress_callback=progress_callback,
-        )
-
-    def start_q_learning_navigation(self) -> bool:
-        if not self._q_learning_trained or self._q_learning_model is None:
+    def start_rl_navigation(self, algorithm: str) -> bool:
+        """Start navigation for any RL algorithm registered in PATH_ENTRYPOINTS."""
+        algo = str(algorithm).strip()
+        model = self._rl_models.get(algo)
+        if not self._rl_trained.get(algo) or model is None:
             return False
         if self._end_map_xyz is None:
+            return False
+
+        build_fn = PATH_ENTRYPOINTS.get(algo)
+        if build_fn is None:
             return False
 
         start_xyz = self._agent_map_xyz if self._agent_map_xyz is not None else self._start_map_xyz
         if start_xyz is None:
             return False
 
-        planned = build_q_learning_path(
-            model=self._q_learning_model,
-            start_xyz=start_xyz,
-            end_xyz=self._end_map_xyz,
-            map_to_index=self._map_to_index,
-        )
-        if not planned:
-            return False
-        planned = self._optimize_rl_path(planned)
-        return self._set_navigation_path(planned)
-
-    def start_dqn_navigation(self) -> bool:
-        if not self._dqn_trained or self._dqn_model is None:
-            return False
-        if self._end_map_xyz is None:
-            return False
-
-        start_xyz = self._agent_map_xyz if self._agent_map_xyz is not None else self._start_map_xyz
-        if start_xyz is None:
-            return False
-
-        planned = build_dqn_path(
-            model=self._dqn_model,
-            start_xyz=start_xyz,
-            end_xyz=self._end_map_xyz,
-            map_to_index=self._map_to_index,
-        )
-        if not planned:
-            return False
-        planned = self._optimize_rl_path(planned)
-        return self._set_navigation_path(planned)
-
-    def start_ppo_navigation(self) -> bool:
-        if not self._ppo_trained or self._ppo_model is None:
-            return False
-        if self._end_map_xyz is None:
-            return False
-
-        start_xyz = self._agent_map_xyz if self._agent_map_xyz is not None else self._start_map_xyz
-        if start_xyz is None:
-            return False
-
-        planned = build_ppo_path(
-            model=self._ppo_model,
-            start_xyz=start_xyz,
-            end_xyz=self._end_map_xyz,
-            map_to_index=self._map_to_index,
-        )
-        if not planned:
-            return False
-        planned = self._optimize_rl_path(planned)
-        return self._set_navigation_path(planned)
-
-    def start_her_navigation(self) -> bool:
-        if not self._her_trained or self._her_model is None:
-            return False
-        if self._end_map_xyz is None:
-            return False
-
-        start_xyz = self._agent_map_xyz if self._agent_map_xyz is not None else self._start_map_xyz
-        if start_xyz is None:
-            return False
-
-        planned = build_her_path(
-            model=self._her_model,
+        planned = build_fn(
+            model=model,
             start_xyz=start_xyz,
             end_xyz=self._end_map_xyz,
             map_to_index=self._map_to_index,
@@ -920,7 +796,7 @@ class RotatingCubeWidget(QOpenGLWidget):
 
         self._occupancy = occ
         self._heights = self._derive_heightfield_from_occupancy(self._occupancy, self._cell_size)
-        self._invalidate_q_learning()
+        self._invalidate_rl_models()
         self._recompile_display_list_from_current_heights()
         self._emit_edit_state()
         return placed
@@ -1116,7 +992,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         occ[ix0 : ix1 + 1, iy0 : iy1 + 1, iz0 : iz1 + 1] = 1
         self._occupancy = occ
         self._heights = self._derive_heightfield_from_occupancy(self._occupancy, self._cell_size)
-        self._invalidate_q_learning()
+        self._invalidate_rl_models()
         self._recompile_display_list_from_current_heights()
         self._emit_edit_state()
         return True
@@ -1185,7 +1061,7 @@ class RotatingCubeWidget(QOpenGLWidget):
 
         self._occupancy = occ
         self._heights = self._derive_heightfield_from_occupancy(self._occupancy, self._cell_size)
-        self._invalidate_q_learning()
+        self._invalidate_rl_models()
         self._recompile_display_list_from_current_heights()
         self._emit_edit_state()
         return True

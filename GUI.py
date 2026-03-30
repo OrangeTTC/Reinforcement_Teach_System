@@ -18,7 +18,7 @@ from map.map_qt_3d_view import ThreeDWindow
 class StartWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("RL 3D Navigation Demo")
+        self.setWindowTitle("无人机路径规划算法教学实验系统")
         self.setMinimumSize(520, 320)
         self._child: QMainWindow | None = None
 
@@ -28,7 +28,7 @@ class StartWindow(QMainWindow):
         layout.setSpacing(12)
         layout.setAlignment(Qt.AlignCenter)
 
-        title = QLabel("Reinforcement Learning Navigation Demo")
+        title = QLabel("无人机路径规划算法教学实验系统")
         title_font = QFont()
         title_font.setPointSize(22)
         title_font.setBold(True)
@@ -36,12 +36,12 @@ class StartWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        btn_start = QPushButton("Start")
+        btn_start = QPushButton("开始")
         btn_start.setFixedHeight(48)
         btn_start.clicked.connect(self._open_3d)
         layout.addWidget(btn_start)
 
-        btn_exit = QPushButton("Exit")
+        btn_exit = QPushButton("退出")
         btn_exit.setFixedHeight(48)
         btn_exit.clicked.connect(QApplication.instance().quit)
         layout.addWidget(btn_exit)

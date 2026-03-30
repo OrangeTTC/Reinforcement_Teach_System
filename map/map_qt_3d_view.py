@@ -30,13 +30,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from algorithm.algorithm_entrypoints import TRAIN_ENTRYPOINTS
 
-class ThreeDWindow(QMainWindow):
+# Algorithm names shown in the combo box: A* first (search-based), then all RL algorithms.
+_ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
     """A minimal in-window 3D animation using QOpenGLWidget + PyOpenGL."""
 
     def __init__(self, terrain_path: str | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("3D View (OpenGL)")
+        self.setWindowTitle("三维视图 (OpenGL)")
         self.setMinimumSize(1000, 700)
 
         self._settings = QSettings("RL3D", "NavigationDemo")
@@ -68,15 +70,15 @@ class ThreeDWindow(QMainWindow):
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(6)
 
-        algo_label = QLabel("Algorithm")
+        algo_label = QLabel("算法")
         algo_label.setMinimumWidth(70)
 
         self.algo_combo = QComboBox()
-        self.algo_combo.addItems(["A*", "Q-learning", "DQN", "PPO", "HER"])
+        self.algo_combo.addItems(_ALGO_NAMES)
         self.algo_combo.setCurrentIndex(0)
         self.algo_combo.setMinimumWidth(170)
 
-        self.train_algo_button = QPushButton("Train")
+        self.train_algo_button = QPushButton("训练")
         self.train_algo_button.setMinimumWidth(90)
         self.algo_status = QLabel("")
         self.algo_progress = QProgressBar()
@@ -85,7 +87,7 @@ class ThreeDWindow(QMainWindow):
         self.algo_progress.setTextVisible(True)
         self.algo_progress.setFormat("%p%")
 
-        terrain_label = QLabel("Terrain")
+        terrain_label = QLabel("地形")
         terrain_label.setMinimumWidth(70)
 
         self.terrain_combo = QComboBox()
@@ -93,25 +95,25 @@ class ThreeDWindow(QMainWindow):
 
         # Scheme 2: HDF5 occupancy-grid maps.
         self._terrain_options: dict[str, str] = {
-            "Flat (height=10)": "map_flat.h5",
-            "Mountain": "map_mountain.h5",
+            "平坦 (高度=10)": "map_flat.h5",
+            "山地": "map_mountain.h5",
         }
         self.terrain_combo.addItems(list(self._terrain_options.keys()))
 
-        saved_terrain = str(self._settings.value("terrain/key", "Flat (height=10)"))
+        saved_terrain = str(self._settings.value("terrain/key", "平坦 (高度=10)"))
         if saved_terrain in self._terrain_options:
             self.terrain_combo.setCurrentText(saved_terrain)
         else:
             self.terrain_combo.setCurrentIndex(0)
 
-        self.clear_terrain_setting_button = QPushButton("Clear Terrain Setting")
+        self.clear_terrain_setting_button = QPushButton("清除地形设置")
         self.clear_terrain_setting_button.setMinimumWidth(140)
-        self.export_terrain_button = QPushButton("Export Terrain CSV")
+        self.export_terrain_button = QPushButton("导出地形 CSV")
         self.export_terrain_button.setMinimumWidth(120)
-        self.import_terrain_button = QPushButton("Import Terrain CSV")
+        self.import_terrain_button = QPushButton("导入地形 CSV")
         self.import_terrain_button.setMinimumWidth(120)
 
-        default_terrain_key = "Flat (height=10)"
+        default_terrain_key = "平坦 (高度=10)"
 
         def edited_terrain_path(key: str) -> Path | None:
             rel = self._terrain_options.get(key)
@@ -177,8 +179,8 @@ class ThreeDWindow(QMainWindow):
             path = resolved_terrain_path_for_key(default_terrain_key)
             if path:
                 self._gl.set_terrain_path(path)
-            self.edit_status.setText("Terrain settings cleared; using default terrain")
-            self.trace_status.setText("Terrain setting cleared")
+            self.edit_status.setText("地形设置已清除；使用默认地形")
+            self.trace_status.setText("地形设置已清除")
             update_navigation_ui()
 
         def on_export_terrain_csv() -> None:
@@ -190,37 +192,37 @@ class ThreeDWindow(QMainWindow):
 
             path, _ = QFileDialog.getSaveFileName(
                 self,
-                "Export Terrain CSV",
+                "导出地形 CSV",
                 default_path,
-                "CSV Files (*.csv)",
+                "CSV 文件 (*.csv)",
             )
             if not path:
                 return
 
             if self._gl.export_current_terrain_csv(path):
-                self.edit_status.setText(f"Terrain exported: {Path(path).name}")
+                self.edit_status.setText(f"地形已导出：{Path(path).name}")
             else:
-                self.edit_status.setText("Export failed (current terrain is not editable occupancy)")
+                self.edit_status.setText("导出失败（当前地形不可编辑）")
 
         def on_import_terrain_csv() -> None:
             path, _ = QFileDialog.getOpenFileName(
                 self,
-                "Import Terrain CSV",
+                "导入地形 CSV",
                 str(Path(__file__).resolve().parent),
-                "CSV Files (*.csv)",
+                "CSV 文件 (*.csv)",
             )
             if not path:
                 return
 
             if not self._gl.import_terrain_csv(path):
-                self.edit_status.setText("Import failed (invalid CSV terrain format)")
+                self.edit_status.setText("导入失败（无效的 CSV 地形格式）")
                 update_navigation_ui()
                 return
 
             if persist_active_terrain():
-                self.edit_status.setText(f"Terrain imported and saved: {Path(path).name}")
+                self.edit_status.setText(f"地形已导入并保存：{Path(path).name}")
             else:
-                self.edit_status.setText(f"Terrain imported, but save failed: {Path(path).name}")
+                self.edit_status.setText(f"地形已导入，但保存失败：{Path(path).name}")
             update_navigation_ui()
 
         self.terrain_combo.currentIndexChanged.connect(on_terrain_changed)
@@ -279,7 +281,7 @@ class ThreeDWindow(QMainWindow):
         self.xyz_label = QLabel("XYZ: --")
         self.xyz_label.setMinimumWidth(140)
 
-        self.axes_checkbox = QCheckBox("Axes")
+        self.axes_checkbox = QCheckBox("坐标轴")
         self.axes_checkbox.setChecked(True)
 
         view_row = QWidget()
@@ -300,11 +302,11 @@ class ThreeDWindow(QMainWindow):
         edit_layout.setContentsMargins(0, 0, 0, 0)
         edit_layout.setSpacing(6)
 
-        edit_title = QLabel("Edit Terrain")
+        edit_title = QLabel("编辑地形")
         edit_title.setMinimumWidth(70)
 
         self.shape_combo = QComboBox()
-        self.shape_combo.addItems(["Cuboid", "Cylinder"])
+        self.shape_combo.addItems(["长方体", "圆柱体"])
         self.shape_combo.setMinimumWidth(90)
 
         # Cuboid inputs: two diagonal corners (x0,y0,z0) and (x1,y1,z1)
@@ -331,10 +333,10 @@ class ThreeDWindow(QMainWindow):
         hint = QLabel("(0-100)")
         hint.setMinimumWidth(50)
 
-        self.add_button = QPushButton("Add")
+        self.add_button = QPushButton("添加")
         self.add_button.setMinimumWidth(70)
 
-        self.undo_button = QPushButton("Undo")
+        self.undo_button = QPushButton("撤销")
         self.undo_button.setMinimumWidth(70)
         self.undo_button.setEnabled(False)
         self.undo_button.setShortcut("Ctrl+Z")
@@ -344,7 +346,7 @@ class ThreeDWindow(QMainWindow):
         self.random_count.setValue(10)
         self.random_count.setFixedWidth(72)
 
-        self.random_button = QPushButton("Random Buildings")
+        self.random_button = QPushButton("随机建筑")
         self.random_button.setMinimumWidth(120)
 
         self.edit_status = QLabel("")
@@ -428,7 +430,7 @@ class ThreeDWindow(QMainWindow):
         trace_layout.setContentsMargins(0, 0, 0, 0)
         trace_layout.setSpacing(6)
 
-        trace_title = QLabel("Trace Points")
+        trace_title = QLabel("路径点")
 
         self.sx_edit = QLineEdit(); self.sx_edit.setPlaceholderText("sx")
         self.sy_edit = QLineEdit(); self.sy_edit.setPlaceholderText("sy")
@@ -458,7 +460,7 @@ class ThreeDWindow(QMainWindow):
         row_start_layout = QHBoxLayout(row_start)
         row_start_layout.setContentsMargins(0, 0, 0, 0)
         row_start_layout.setSpacing(6)
-        row_start_layout.addWidget(QLabel("Start"))
+        row_start_layout.addWidget(QLabel("起点"))
         row_start_layout.addWidget(self.sx_edit)
         row_start_layout.addWidget(self.sy_edit)
         row_start_layout.addWidget(self.sz_edit)
@@ -468,17 +470,17 @@ class ThreeDWindow(QMainWindow):
         row_end_layout = QHBoxLayout(row_end)
         row_end_layout.setContentsMargins(0, 0, 0, 0)
         row_end_layout.setSpacing(6)
-        row_end_layout.addWidget(QLabel("End"))
+        row_end_layout.addWidget(QLabel("终点"))
         row_end_layout.addWidget(self.ex_edit)
         row_end_layout.addWidget(self.ey_edit)
         row_end_layout.addWidget(self.ez_edit)
         row_end_layout.addStretch(1)
 
-        self.set_trace_button = QPushButton("Set Start/End")
-        self.clear_trace_setting_button = QPushButton("Clear Start/End")
+        self.set_trace_button = QPushButton("设置起终点")
+        self.clear_trace_setting_button = QPushButton("清除起终点")
         self.clear_trace_setting_button.setMinimumWidth(130)
-        self.reset_agent_button = QPushButton("Reset Ball")
-        self.navigate_button = QPushButton("Navigate")
+        self.reset_agent_button = QPushButton("重置小球")
+        self.navigate_button = QPushButton("导航")
         self.navigate_speed = QSpinBox()
         self.navigate_speed.setRange(5, 20)
         self.navigate_speed.setValue(10)
@@ -500,10 +502,10 @@ class ThreeDWindow(QMainWindow):
         metrics_layout = QVBoxLayout(metrics_bar)
         metrics_layout.setContentsMargins(0, 0, 0, 0)
         metrics_layout.setSpacing(6)
-        metrics_layout.addWidget(QLabel("Metrics"))
+        metrics_layout.addWidget(QLabel("性能指标"))
 
         self.metrics_table = QTableWidget(0, 5)
-        self.metrics_table.setHorizontalHeaderLabels(["run", "algorithm", "training time", "navigate length", "navigate time"])
+        self.metrics_table.setHorizontalHeaderLabels(["运行", "算法", "训练时间", "导航路径长度", "导航时间"])
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setMinimumHeight(170)
         self.metrics_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -550,37 +552,37 @@ class ThreeDWindow(QMainWindow):
 
         def on_metrics_row_clicked(row: int, _column: int) -> None:
             if row < 0 or row >= len(self._metrics_history):
-                self.trace_status.setText("Invalid history row")
+                self.trace_status.setText("无效的历史行")
                 return
 
             item = self._metrics_history[row]
             path = list(item.get("path", []))
             if not path:
-                self.trace_status.setText("No trajectory recorded for this run")
+                self.trace_status.setText("此次运行没有轨迹记录")
                 return
 
             if self._gl.replay_navigation_path(path):
                 algo_name = str(item.get("algorithm", "Unknown"))
                 run_no = int(item.get("run", 0))
-                self.trace_status.setText(f"Replaying run {run_no} ({algo_name})")
+                self.trace_status.setText(f"正在回放第 {run_no} 次运行 ({algo_name})")
             else:
-                self.trace_status.setText("Replay failed for selected run")
+                self.trace_status.setText("选中运行的回放失败")
 
         def on_delete_selected_history() -> None:
             row = self.metrics_table.currentRow()
             if row < 0 or row >= self.metrics_table.rowCount():
-                self.trace_status.setText("Select a history row to delete")
+                self.trace_status.setText("请选择要删除的历史行")
                 return
 
             self.metrics_table.removeRow(row)
             if 0 <= row < len(self._metrics_history):
                 self._metrics_history.pop(row)
-            self.trace_status.setText("Selected history deleted")
+            self.trace_status.setText("已删除选中历史")
 
         def on_clear_history() -> None:
             self.metrics_table.setRowCount(0)
             self._metrics_history.clear()
-            self.trace_status.setText("All history cleared")
+            self.trace_status.setText("所有历史已清除")
 
         metrics_layout.addWidget(self.metrics_table)
 
@@ -588,8 +590,8 @@ class ThreeDWindow(QMainWindow):
         metrics_btn_layout = QHBoxLayout(metrics_btn_row)
         metrics_btn_layout.setContentsMargins(0, 0, 0, 0)
         metrics_btn_layout.setSpacing(8)
-        self.delete_history_button = QPushButton("Delete Selected")
-        self.clear_history_button = QPushButton("Clear History")
+        self.delete_history_button = QPushButton("删除选中")
+        self.clear_history_button = QPushButton("清除历史")
         metrics_btn_layout.addWidget(self.delete_history_button)
         metrics_btn_layout.addWidget(self.clear_history_button)
         metrics_btn_layout.addStretch(1)
@@ -624,7 +626,7 @@ class ThreeDWindow(QMainWindow):
         row_trace_hint_layout = QHBoxLayout(row_trace_hint)
         row_trace_hint_layout.setContentsMargins(0, 0, 0, 0)
         row_trace_hint_layout.setSpacing(8)
-        row_trace_hint_layout.addWidget(QLabel("Move ball: WASD, R/F"))
+        row_trace_hint_layout.addWidget(QLabel("移动小球：WASD, R/F"))
         row_trace_hint_layout.addWidget(self.trace_status, stretch=1)
 
         trace_layout.addWidget(row_trace_title)
@@ -640,7 +642,7 @@ class ThreeDWindow(QMainWindow):
         self.axes_checkbox.toggled.connect(self._gl.set_show_axes)
 
         def update_shape_ui() -> None:
-            is_cuboid = self.shape_combo.currentText() == "Cuboid"
+            is_cuboid = self.shape_combo.currentText() == "长方体"
             for w in [
                 self._p0_label,
                 self.c_x0,
@@ -669,7 +671,7 @@ class ThreeDWindow(QMainWindow):
 
         def on_add() -> None:
             try:
-                if self.shape_combo.currentText() == "Cuboid":
+                if self.shape_combo.currentText() == "长方体":
                     ok = self._gl.add_cuboid_map(
                         parse_f(self.c_x0), parse_f(self.c_y0), parse_f(self.c_z0),
                         parse_f(self.c_x1), parse_f(self.c_y1), parse_f(self.c_z1),
@@ -681,36 +683,36 @@ class ThreeDWindow(QMainWindow):
                     )
 
                 if not ok:
-                    self.edit_status.setText("Current terrain is not editable (non-HDF5 occupancy)")
+                    self.edit_status.setText("当前地形不可编辑（非 HDF5 占用格式）")
                 else:
                     if persist_active_terrain():
-                        self.edit_status.setText("Added and saved")
+                        self.edit_status.setText("已添加并保存")
                     else:
-                        self.edit_status.setText("Added (save failed)")
+                        self.edit_status.setText("已添加（保存失败）")
                 update_navigation_ui()
             except Exception:
-                self.edit_status.setText("Invalid input")
+                self.edit_status.setText("输入无效")
 
         def on_undo() -> None:
             if self._gl.undo_last_edit():
                 if persist_active_terrain():
-                    self.edit_status.setText("Undone and saved")
+                    self.edit_status.setText("已撤销并保存")
                 else:
-                    self.edit_status.setText("Undone (save failed)")
+                    self.edit_status.setText("已撤销（保存失败）")
             else:
-                self.edit_status.setText("Nothing to undo")
+                self.edit_status.setText("无可撤销操作")
             update_navigation_ui()
 
         def on_random_buildings() -> None:
             count = int(self.random_count.value())
             added = self._gl.add_random_buildings_map(count)
             if added <= 0:
-                self.edit_status.setText("Current terrain is not editable (non-HDF5 occupancy)")
+                self.edit_status.setText("当前地形不可编辑（非 HDF5 占用格式）")
             else:
                 if persist_active_terrain():
-                    self.edit_status.setText(f"Added {added} random buildings and saved")
+                    self.edit_status.setText(f"已随机添加 {added} 栋建筑并保存")
                 else:
-                    self.edit_status.setText(f"Added {added} random buildings (save failed)")
+                    self.edit_status.setText(f"已随机添加 {added} 栋建筑（保存失败）")
             update_navigation_ui()
 
         def on_set_trace_points() -> None:
@@ -722,7 +724,7 @@ class ThreeDWindow(QMainWindow):
                 ey = float(self.ey_edit.text().strip())
                 ez = float(self.ez_edit.text().strip())
             except Exception:
-                self.trace_status.setText("Invalid start/end input")
+                self.trace_status.setText("起点/终点输入无效")
                 return
 
             if self._gl.set_trace_points_map(sx, sy, sz, ex, ey, ez):
@@ -732,10 +734,10 @@ class ThreeDWindow(QMainWindow):
                 self._settings.setValue("trace/ex", f"{ex:g}")
                 self._settings.setValue("trace/ey", f"{ey:g}")
                 self._settings.setValue("trace/ez", f"{ez:g}")
-                self.trace_status.setText("Start/End set; ball spawned at start")
+                self.trace_status.setText("起终点已设置；小球已在起点生成")
                 update_navigation_ui()
             else:
-                self.trace_status.setText("Failed to set start/end")
+                self.trace_status.setText("设置起终点失败")
 
         def on_clear_trace_setting() -> None:
             for k in ["trace/sx", "trace/sy", "trace/sz", "trace/ex", "trace/ey", "trace/ez"]:
@@ -745,14 +747,14 @@ class ThreeDWindow(QMainWindow):
                 le.clear()
 
             self._gl.clear_trace_points()
-            self.trace_status.setText("Start/End cleared")
+            self.trace_status.setText("起终点已清除")
             update_navigation_ui()
 
         def on_reset_ball() -> None:
             if self._gl.reset_agent_to_start():
-                self.trace_status.setText("Ball reset to start")
+                self.trace_status.setText("小球已重置至起点")
             else:
-                self.trace_status.setText("No start point")
+                self.trace_status.setText("未设置起点")
 
         def update_navigation_ui() -> None:
             algo = self.algo_combo.currentText().strip()
@@ -769,18 +771,18 @@ class ThreeDWindow(QMainWindow):
             self.navigate_speed.setEnabled(can_nav)
 
             if is_astar:
-                self.algo_status.setText("A* ready")
+                self.algo_status.setText("A* 就绪")
             elif trained:
-                self.algo_status.setText(f"{algo} trained")
+                self.algo_status.setText(f"{algo} 已训练")
             else:
-                self.algo_status.setText(f"{algo} not trained")
-                self.trace_status.setText("Please train before Navigate")
+                self.algo_status.setText(f"{algo} 未训练")
+                self.trace_status.setText("请先训练再导航")
 
         def on_train_algorithm() -> None:
             algo = self.algo_combo.currentText().strip()
 
             self.algo_progress.setValue(0)
-            self.algo_status.setText(f"{algo} training...")
+            self.algo_status.setText(f"{algo} 训练中...")
 
             def on_progress(value: int) -> None:
                 self.algo_progress.setValue(max(0, min(100, int(value))))
@@ -797,7 +799,7 @@ class ThreeDWindow(QMainWindow):
             if ok and self.algo_progress.value() < 100:
                 self.algo_progress.setValue(100)
             if ok:
-                self.trace_status.setText(f"{algo} training finished")
+                self.trace_status.setText(f"{algo} 训练完成")
             else:
                 self.trace_status.setText(msg)
             update_navigation_ui()
@@ -806,6 +808,7 @@ class ThreeDWindow(QMainWindow):
             algo = self.algo_combo.currentText().strip()
 
             self._gl.set_navigation_speed_units_per_sec(float(self.navigate_speed.value()))
+
             if algo == "A*":
                 t0 = perf_counter()
                 ok = self._gl.start_astar_navigation()
@@ -813,66 +816,20 @@ class ThreeDWindow(QMainWindow):
                 nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
                 nav_path = self._gl.get_last_navigation_path() if ok else []
                 append_metric_log(algo, 0.0, nav_length, float(nav_elapsed), nav_path)
-                if ok:
-                    pass
-                self.trace_status.setText("A* navigation started" if ok else "A* failed: set valid start/end and reachable path")
+                self.trace_status.setText("A* 导航已开始" if ok else "A* 失败：请设置有效起终点及可通行路径")
                 return
 
-            if algo == "Q-learning":
-                if not self._gl.is_algorithm_trained(algo):
-                    self.trace_status.setText("Q-learning is not trained")
-                    return
-                t0 = perf_counter()
-                ok = self._gl.start_q_learning_navigation()
-                nav_elapsed = perf_counter() - t0
-                nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                nav_path = self._gl.get_last_navigation_path() if ok else []
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
-                if ok:
-                    pass
-                self.trace_status.setText("Q-learning navigation started" if ok else "Q-learning failed: retrain or reset start/end")
+            # All RL algorithms are handled generically via the registry.
+            if not self._gl.is_algorithm_trained(algo):
+                self.trace_status.setText(f"{algo} 未训练")
                 return
-
-            if algo == "DQN":
-                if not self._gl.is_algorithm_trained(algo):
-                    self.trace_status.setText("DQN is not trained")
-                    return
-                t0 = perf_counter()
-                ok = self._gl.start_dqn_navigation()
-                nav_elapsed = perf_counter() - t0
-                nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                nav_path = self._gl.get_last_navigation_path() if ok else []
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
-                self.trace_status.setText("DQN navigation started" if ok else "DQN failed: retrain or reset start/end")
-                return
-
-            if algo == "PPO":
-                if not self._gl.is_algorithm_trained(algo):
-                    self.trace_status.setText("PPO is not trained")
-                    return
-                t0 = perf_counter()
-                ok = self._gl.start_ppo_navigation()
-                nav_elapsed = perf_counter() - t0
-                nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                nav_path = self._gl.get_last_navigation_path() if ok else []
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
-                self.trace_status.setText("PPO navigation started" if ok else "PPO failed: retrain or reset start/end")
-                return
-
-            if algo == "HER":
-                if not self._gl.is_algorithm_trained(algo):
-                    self.trace_status.setText("HER is not trained")
-                    return
-                t0 = perf_counter()
-                ok = self._gl.start_her_navigation()
-                nav_elapsed = perf_counter() - t0
-                nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                nav_path = self._gl.get_last_navigation_path() if ok else []
-                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
-                self.trace_status.setText("HER navigation started" if ok else "HER failed: retrain or reset start/end")
-                return
-
-            self.trace_status.setText(f"{algo} navigation is not implemented yet")
+            t0 = perf_counter()
+            ok = self._gl.start_rl_navigation(algo)
+            nav_elapsed = perf_counter() - t0
+            nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
+            nav_path = self._gl.get_last_navigation_path() if ok else []
+            append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
+            self.trace_status.setText(f"{algo} 导航已开始" if ok else f"{algo} 失败：请重新训练或重置起终点")
 
         def on_speed_changed(value: int) -> None:
             # Apply speed immediately so running navigation changes speed in real time.
