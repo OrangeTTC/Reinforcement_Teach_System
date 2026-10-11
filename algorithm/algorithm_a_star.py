@@ -10,6 +10,8 @@ import heapq
 import math
 from typing import Callable
 
+from algorithm.flight_constraints import FlightConstraints, FlightTrajectory, plan_flight_astar
+
 
 MapPoint3 = tuple[float, float, float]
 
@@ -26,12 +28,20 @@ def plan_astar_path_map_xyz(
     occ_nz: int | None,
     heights,
     map_to_index: Callable[[float, int, str], int],
+    flight_constraints: FlightConstraints | None = None,
+    voxel_size: float = 1.0,
 ) -> list[MapPoint3]:
     """Plan an A* path in map XYZ.
 
     - If occupancy exists: run true 3D A* in free voxels (x, z_height, y_plane).
     - Else: run a 2D planar fallback on heightfield and interpolate Z.
     """
+
+    if flight_constraints is not None:
+        try:
+            return plan_astar_flight_trajectory(start_xyz, end_xyz, occupancy, voxel_size, flight_constraints).samples_map()
+        except (ValueError, AttributeError):
+            return []
 
     sx, sy, sz = start_xyz
     ex, ey, ez = end_xyz
@@ -169,6 +179,20 @@ def plan_astar_path_map_xyz(
         waypoints.append((_clamp_0_100(mx), _clamp_0_100(my), _clamp_0_100(mz)))
 
     return waypoints
+
+
+def plan_astar_flight_trajectory(
+    start_xyz: MapPoint3, end_xyz: MapPoint3, occupancy,
+    voxel_size: float, constraints: FlightConstraints,
+) -> FlightTrajectory:
+    """Inflate by v²/a_lat, search with climb limits, then fit fixed-radius arcs.
+
+    Keeps exact arc lengths/positions for metrics and execution. Unreachable or
+    non-fitting trajectories raise ValueError with a user-readable explanation.
+    """
+    if occupancy is None:
+        raise ValueError("飞机性能约束需要三维体素地图")
+    return plan_flight_astar(start_xyz, end_xyz, occupancy, voxel_size, constraints)
 
 
 def _nearest_free_voxel(occ, start: tuple[int, int, int]) -> tuple[int, int, int] | None:

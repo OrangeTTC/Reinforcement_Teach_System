@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from algorithm.algorithm_q_learning import train_q_learning_full_map
+from algorithm.flight_constraints import FlightConstraints, build_flight_policy_path, copy_flight_context
 
 
 @dataclass
@@ -35,6 +36,9 @@ class PPOModel:
     is_3d: bool
     actions: tuple[tuple[int, ...], ...]
     distance_map: object
+    flight_constraints: FlightConstraints | None = None
+    flight_voxel_size: float = 1.0
+    flight_valid_moves: object = None
 
 
 def _clamp_0_100(v: float) -> float:
@@ -206,6 +210,8 @@ def train_ppo_full_map(
     end_map_xyz: tuple[float, float, float] | None,
     map_to_index: Callable[[float, int, str], int],
     progress_callback: Callable[[int], None] | None = None,
+    flight_constraints: FlightConstraints | None = None,
+    voxel_size: float = 1.0,
 ) -> tuple[bool, str, PPOModel | None]:
     """Train PPO policy on full map.
 
@@ -228,6 +234,8 @@ def train_ppo_full_map(
         end_map_xyz=end_map_xyz,
         map_to_index=map_to_index,
         progress_callback=teacher_progress,
+        flight_constraints=flight_constraints,
+        voxel_size=voxel_size,
     )
     if not ok or teacher_model is None:
         return (False, "PPO training failed: cannot build teacher targets", None)
@@ -405,6 +413,7 @@ def train_ppo_full_map(
     model.policy = dense_policy
     model.value = dense_value
 
+    copy_flight_context(model, teacher_model)
     if progress_callback is not None:
         progress_callback(100)
 
@@ -421,6 +430,12 @@ def build_ppo_path(
     end_xyz: tuple[float, float, float],
     map_to_index: Callable[[float, int, str], int],
 ) -> list[tuple[float, float, float]]:
+    if model.flight_constraints is not None:
+        import numpy as np
+        def scores(node):
+            inputs = _state_batch_from_indices(np.asarray([node]), model.grid_shape, True)
+            return _actor_forward(model, inputs)[2][0]
+        return build_flight_policy_path(model, start_xyz, end_xyz, scores)
     import numpy as np
 
     _ = end_xyz

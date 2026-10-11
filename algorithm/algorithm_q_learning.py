@@ -11,6 +11,8 @@ import heapq
 from dataclasses import dataclass
 from typing import Callable
 
+from algorithm.flight_constraints import FlightConstraints, build_flight_policy_path, build_flight_teacher
+
 
 def _clamp_0_100(v: float) -> float:
     return max(0.0, min(100.0, float(v)))
@@ -26,6 +28,9 @@ class QLearningModel:
     is_3d: bool
     actions: tuple[tuple[int, ...], ...]
     distance_map: object
+    flight_constraints: FlightConstraints | None = None
+    flight_voxel_size: float = 1.0
+    flight_valid_moves: object = None
 
 
 def _actions_3d_26() -> tuple[tuple[int, int, int], ...]:
@@ -262,13 +267,15 @@ def _value_from_distance(dist, gamma: float, goal_reward: float, step_penalty: f
     return values
 
 
-def _build_q_from_values_2d(free_mask, values, goal: tuple[int, int], gamma: float):
+def _build_q_from_values_2d(free_mask, values, goal: tuple[int, int], gamma: float, alpha: float):
     import numpy as np
 
     nx, ny = int(free_mask.shape[0]), int(free_mask.shape[1])
     actions = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
     q = np.full((nx, ny, len(actions)), -1e9, dtype=np.float32)
     gx, gy = goal
+
+    alpha = float(max(0.0, min(1.0, float(alpha))))
 
     for sx, sy in np.argwhere(free_mask):
         sx = int(sx)
@@ -282,12 +289,12 @@ def _build_q_from_values_2d(free_mask, values, goal: tuple[int, int], gamma: flo
                 reward = -8.0
             elif (nx_i, ny_i) == (gx, gy):
                 reward = 200.0
-            q[sx, sy, a] = float(reward) + float(gamma) * float(values[nx_i, ny_i])
+            q[sx, sy, a] = float(reward) + float(alpha) * float(gamma) * float(values[nx_i, ny_i])
 
     return q, actions
 
 
-def _build_q_from_values_3d(free_mask, values, goal: tuple[int, int, int], gamma: float):
+def _build_q_from_values_3d(free_mask, values, goal: tuple[int, int, int], gamma: float, alpha: float):
     import numpy as np
 
     nx, ny_h, nz = int(free_mask.shape[0]), int(free_mask.shape[1]), int(free_mask.shape[2])
@@ -295,6 +302,8 @@ def _build_q_from_values_3d(free_mask, values, goal: tuple[int, int, int], gamma
     costs = [_move_cost_3d(a) for a in actions]
     q = np.full((nx, ny_h, nz, len(actions)), -1e9, dtype=np.float32)
     gx, gy_h, gz = goal
+
+    alpha = float(max(0.0, min(1.0, float(alpha))))
 
     for sx, sy_h, sz in np.argwhere(free_mask):
         sx = int(sx)
@@ -310,9 +319,202 @@ def _build_q_from_values_3d(free_mask, values, goal: tuple[int, int, int], gamma
                 reward = -8.0
             elif (nx_i, ny_i, nz_i) == (gx, gy_h, gz):
                 reward = 260.0
-            q[sx, sy_h, sz, a] = float(reward) + float(gamma) * float(values[nx_i, ny_i, nz_i])
+            q[sx, sy_h, sz, a] = float(reward) + float(alpha) * float(gamma) * float(values[nx_i, ny_i, nz_i])
 
     return q, actions
+
+
+def _best_descending_neighbor_3d(model: QLearningModel, node, visited):
+    cx, cy_h, cz = node
+    nx, ny_h, nz = model.grid_shape
+    cur_d = float(model.distance_map[cx, cy_h, cz])
+    best = None
+    best_d = float("inf")
+    for bdx, bdy_h, bdz in model.actions:
+        bx = cx + bdx
+        by = cy_h + bdy_h
+        bz = cz + bdz
+        if bx < 0 or bx >= nx or by < 0 or by >= ny_h or bz < 0 or bz >= nz:
+            continue
+        if not bool(model.free_mask[bx, by, bz]):
+            continue
+        if (bx, by, bz) in visited:
+            continue
+        bd = float(model.distance_map[bx, by, bz])
+        if not math.isfinite(bd):
+            continue
+        if bd < best_d:
+            best_d = bd
+            best = (bx, by, bz)
+    if best is None or best_d >= cur_d:
+        return None
+    return best
+
+
+def _best_descending_neighbor_2d(model: QLearningModel, node, visited):
+    cx, cy = node
+    nx, nz = model.grid_shape
+    cur_d = float(model.distance_map[cx, cy])
+    best = None
+    best_d = float("inf")
+    for bdx, bdy in model.actions:
+        bx = cx + bdx
+        by = cy + bdy
+        if bx < 0 or bx >= nx or by < 0 or by >= nz:
+            continue
+        if not bool(model.free_mask[bx, by]):
+            continue
+        if (bx, by) in visited:
+            continue
+        bd = float(model.distance_map[bx, by])
+        if not math.isfinite(bd):
+            continue
+        if bd < best_d:
+            best_d = bd
+            best = (bx, by)
+    if best is None or best_d >= cur_d:
+        return None
+    return best
+
+
+def _astar_path_indices_3d(
+    free_mask,
+    start: tuple[int, int, int],
+    goal: tuple[int, int, int],
+) -> list[tuple[int, int, int]]:
+    nx, ny_h, nz = int(free_mask.shape[0]), int(free_mask.shape[1]), int(free_mask.shape[2])
+    if start == goal:
+        return [start]
+    if not bool(free_mask[start[0], start[1], start[2]]) or not bool(free_mask[goal[0], goal[1], goal[2]]):
+        return []
+
+    actions = _actions_3d_26()
+    costs = [_move_cost_3d(a) for a in actions]
+
+    def heuristic(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+        dx = float(a[0] - b[0])
+        dy_h = float(a[1] - b[1])
+        dz = float(a[2] - b[2])
+        return math.sqrt(dx * dx + dy_h * dy_h + dz * dz)
+
+    heap = [(heuristic(start, goal), 0, start)]
+    g_score: dict[tuple[int, int, int], float] = {start: 0.0}
+    came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    push_id = 1
+
+    while heap:
+        _f, _id, cur = heapq.heappop(heap)
+        if cur == goal:
+            break
+
+        cur_g = g_score.get(cur)
+        if cur_g is None:
+            continue
+
+        cx, cy_h, cz = cur
+        for (dx, dy_h, dz), step_cost in zip(actions, costs):
+            if not _valid_transition_3d(free_mask, cx, cy_h, cz, dx, dy_h, dz, nx, ny_h, nz):
+                continue
+
+            nx_i = cx + dx
+            ny_i = cy_h + dy_h
+            nz_i = cz + dz
+            node = (nx_i, ny_i, nz_i)
+            cand_g = float(cur_g) + float(step_cost)
+            old_g = g_score.get(node)
+            if old_g is not None and cand_g >= old_g:
+                continue
+
+            g_score[node] = cand_g
+            came_from[node] = cur
+            f_score = cand_g + heuristic(node, goal)
+            heapq.heappush(heap, (f_score, push_id, node))
+            push_id += 1
+
+    if goal not in g_score:
+        return []
+
+    path_idx = [goal]
+    cur = goal
+    while cur != start:
+        parent = came_from.get(cur)
+        if parent is None:
+            return []
+        cur = parent
+        path_idx.append(cur)
+    path_idx.reverse()
+    return path_idx
+
+
+def _astar_path_indices_2d(
+    free_mask,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    actions_2d: tuple[tuple[int, int], ...],
+) -> list[tuple[int, int]]:
+    nx, nz = int(free_mask.shape[0]), int(free_mask.shape[1])
+    if start == goal:
+        return [start]
+    if not bool(free_mask[start[0], start[1]]) or not bool(free_mask[goal[0], goal[1]]):
+        return []
+
+    def step_cost(delta: tuple[int, int]) -> float:
+        dx, dy = delta
+        return math.sqrt(float(dx * dx + dy * dy))
+
+    def heuristic(a: tuple[int, int], b: tuple[int, int]) -> float:
+        dx = float(a[0] - b[0])
+        dy = float(a[1] - b[1])
+        return math.hypot(dx, dy)
+
+    heap = [(heuristic(start, goal), 0, start)]
+    g_score: dict[tuple[int, int], float] = {start: 0.0}
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    push_id = 1
+
+    while heap:
+        _f, _id, cur = heapq.heappop(heap)
+        if cur == goal:
+            break
+
+        cur_g = g_score.get(cur)
+        if cur_g is None:
+            continue
+
+        cx, cy = cur
+        for dx, dy in actions_2d:
+            nx_i = cx + dx
+            ny_i = cy + dy
+            if nx_i < 0 or nx_i >= nx or ny_i < 0 or ny_i >= nz:
+                continue
+            if not bool(free_mask[nx_i, ny_i]):
+                continue
+
+            node = (nx_i, ny_i)
+            cand_g = float(cur_g) + step_cost((dx, dy))
+            old_g = g_score.get(node)
+            if old_g is not None and cand_g >= old_g:
+                continue
+
+            g_score[node] = cand_g
+            came_from[node] = cur
+            f_score = cand_g + heuristic(node, goal)
+            heapq.heappush(heap, (f_score, push_id, node))
+            push_id += 1
+
+    if goal not in g_score:
+        return []
+
+    path_idx = [goal]
+    cur = goal
+    while cur != start:
+        parent = came_from.get(cur)
+        if parent is None:
+            return []
+        cur = parent
+        path_idx.append(cur)
+    path_idx.reverse()
+    return path_idx
 
 
 def train_q_learning_full_map(
@@ -321,6 +523,10 @@ def train_q_learning_full_map(
     end_map_xyz: tuple[float, float, float] | None,
     map_to_index: Callable[[float, int, str], int],
     progress_callback: Callable[[int], None] | None = None,
+    gamma: float = 0.95,
+    alpha: float = 1.0,
+    flight_constraints: FlightConstraints | None = None,
+    voxel_size: float = 1.0,
 ) -> tuple[bool, QLearningModel | None, int, int, tuple[int, int]]:
     import numpy as np
 
@@ -333,8 +539,25 @@ def train_q_learning_full_map(
         except Exception:
             pass
 
-    gamma = 0.95
+    gamma = float(max(0.0, min(0.999999, float(gamma))))
+    alpha = float(max(0.0, min(1.0, float(alpha))))
     step_penalty = -1.0
+
+    if flight_constraints is not None:
+        try:
+            if occupancy is None:
+                return (False, None, 0, 0, (0, 0))
+            fields = build_flight_teacher(occupancy, end_map_xyz, voxel_size,
+                                         flight_constraints, gamma, alpha, progress_callback)
+            model = QLearningModel(**fields)
+            finite = np.isfinite(model.distance_map)
+            episodes = int(np.max(model.distance_map[finite]) / voxel_size)
+            if progress_callback is not None:
+                progress_callback(100)
+            return (True, model, episodes, int(np.count_nonzero(model.free_mask)),
+                    (model.goal_idx[0], model.goal_idx[2]))
+        except ValueError:
+            return (False, None, 0, 0, (0, 0))
 
     if occupancy is not None:
         occ = np.asarray(occupancy)
@@ -359,7 +582,7 @@ def train_q_learning_full_map(
 
         dist = _bfs_distance_3d(free_mask, goal3, progress_callback=progress_callback)
         values = _value_from_distance(dist, gamma=gamma, goal_reward=260.0, step_penalty=step_penalty)
-        q, actions_3d = _build_q_from_values_3d(free_mask, values, goal3, gamma=gamma)
+        q, actions_3d = _build_q_from_values_3d(free_mask, values, goal3, gamma=gamma, alpha=alpha)
         episodes = int(np.max(dist[np.isfinite(dist)])) if np.isfinite(dist).any() else 0
 
         if progress_callback is not None:
@@ -411,7 +634,7 @@ def train_q_learning_full_map(
 
     dist = _bfs_distance_2d(free_mask, (gx, gy), progress_callback=progress_callback)
     values = _value_from_distance(dist, gamma=gamma, goal_reward=200.0, step_penalty=step_penalty)
-    q, actions_2d = _build_q_from_values_2d(free_mask, values, (gx, gy), gamma=gamma)
+    q, actions_2d = _build_q_from_values_2d(free_mask, values, (gx, gy), gamma=gamma, alpha=alpha)
     episodes = int(np.max(dist[np.isfinite(dist)])) if np.isfinite(dist).any() else 0
 
     if progress_callback is not None:
@@ -444,7 +667,35 @@ def build_q_learning_path(
     end_xyz: tuple[float, float, float],
     map_to_index: Callable[[float, int, str], int],
 ) -> list[tuple[float, float, float]]:
+    if model.flight_constraints is not None:
+        return build_flight_policy_path(model, start_xyz, end_xyz)
     import numpy as np
+
+    def to_map_path_3d(path_idx: list[tuple[int, int, int]], nx: int, ny_h: int, nz: int) -> list[tuple[float, float, float]]:
+        planned: list[tuple[float, float, float]] = []
+        for ix, iy_h, iz in path_idx:
+            mx = float(ix) / float(nx - 1) * 100.0
+            my = float(iz) / float(nz - 1) * 100.0
+            mz = float(iy_h) / float(ny_h - 1) * 100.0
+            planned.append((_clamp_0_100(mx), _clamp_0_100(my), _clamp_0_100(mz)))
+        return planned
+
+    def to_map_path_2d(
+        path_idx: list[tuple[int, int]],
+        nx: int,
+        nz: int,
+        start_z: float,
+        end_z: float,
+    ) -> list[tuple[float, float, float]]:
+        n = len(path_idx)
+        planned: list[tuple[float, float, float]] = []
+        for i, (ix, iy) in enumerate(path_idx):
+            mx = float(ix) / float(nx - 1) * 100.0
+            my = float(iy) / float(nz - 1) * 100.0
+            t = 0.0 if n <= 1 else float(i) / float(n - 1)
+            mz = (1.0 - t) * start_z + t * end_z
+            planned.append((_clamp_0_100(mx), _clamp_0_100(my), _clamp_0_100(mz)))
+        return planned
 
     if model.is_3d:
         nx, ny_h, nz = model.grid_shape
@@ -458,12 +709,15 @@ def build_q_learning_path(
         if start is None:
             return []
 
-        if not np.isfinite(model.distance_map[start[0], start[1], start[2]]):
-            return []
-
         if len(model.goal_idx) != 3:
             return []
         gx, gy_h, gz = model.goal_idx
+        if not np.isfinite(model.distance_map[start[0], start[1], start[2]]):
+            tail = _astar_path_indices_3d(model.free_mask, start, (gx, gy_h, gz))
+            if not tail:
+                return []
+            return to_map_path_3d(tail, nx, ny_h, nz)
+
         actions_3d = model.actions
 
         path_idx = [start]
@@ -476,59 +730,46 @@ def build_q_learning_path(
                 break
 
             a = int(model.policy[cx, cy_h, cz])
-            if a < 0 or a >= len(actions_3d):
-                return []
+            proposed = None
+            if 0 <= a < len(actions_3d):
+                dx, dy_h, dz = actions_3d[a]
+                nx_i = cx + dx
+                ny_i = cy_h + dy_h
+                nz_i = cz + dz
+                if (
+                    0 <= nx_i < nx
+                    and 0 <= ny_i < ny_h
+                    and 0 <= nz_i < nz
+                    and bool(model.free_mask[nx_i, ny_i, nz_i])
+                    and (nx_i, ny_i, nz_i) not in visited
+                ):
+                    cur_d = float(model.distance_map[cx, cy_h, cz])
+                    next_d = float(model.distance_map[nx_i, ny_i, nz_i])
+                    if math.isfinite(next_d) and next_d < cur_d:
+                        proposed = (nx_i, ny_i, nz_i)
 
-            dx, dy_h, dz = actions_3d[a]
-            nx_i = cx + dx
-            ny_i = cy_h + dy_h
-            nz_i = cz + dz
-            if nx_i < 0 or nx_i >= nx or ny_i < 0 or ny_i >= ny_h or nz_i < 0 or nz_i >= nz:
-                return []
-            if not bool(model.free_mask[nx_i, ny_i, nz_i]):
-                return []
-
-            cur_d = float(model.distance_map[cx, cy_h, cz])
-            next_d = float(model.distance_map[nx_i, ny_i, nz_i])
-            if not math.isfinite(next_d) or next_d >= cur_d:
-                # Fallback: pick a globally descending neighbor by distance.
-                best = None
-                best_d = float("inf")
-                for bdx, bdy_h, bdz in actions_3d:
-                    bx = cx + bdx
-                    by = cy_h + bdy_h
-                    bz = cz + bdz
-                    if bx < 0 or bx >= nx or by < 0 or by >= ny_h or bz < 0 or bz >= nz:
-                        continue
-                    if not bool(model.free_mask[bx, by, bz]):
-                        continue
-                    bd = float(model.distance_map[bx, by, bz])
-                    if not math.isfinite(bd):
-                        continue
-                    if bd < best_d:
-                        best_d = bd
-                        best = (bx, by, bz)
-                if best is None or best_d >= cur_d:
+            if proposed is None:
+                proposed = _best_descending_neighbor_3d(model, (cx, cy_h, cz), visited)
+            if proposed is None:
+                tail = _astar_path_indices_3d(model.free_mask, (cx, cy_h, cz), (gx, gy_h, gz))
+                if len(tail) < 2:
                     return []
-                nx_i, ny_i, nz_i = best
+                path_idx.extend(tail[1:])
+                cx, cy_h, cz = path_idx[-1]
+                break
 
-            node = (nx_i, ny_i, nz_i)
-            if node in visited:
-                return []
+            node = proposed
             visited.add(node)
             path_idx.append(node)
             cx, cy_h, cz = node
 
         if not path_idx or path_idx[-1] != (gx, gy_h, gz):
-            return []
+            tail = _astar_path_indices_3d(model.free_mask, (cx, cy_h, cz), (gx, gy_h, gz))
+            if len(tail) < 2:
+                return []
+            path_idx.extend(tail[1:])
 
-        planned: list[tuple[float, float, float]] = []
-        for ix, iy_h, iz in path_idx:
-            mx = float(ix) / float(nx - 1) * 100.0
-            my = float(iz) / float(nz - 1) * 100.0
-            mz = float(iy_h) / float(ny_h - 1) * 100.0
-            planned.append((_clamp_0_100(mx), _clamp_0_100(my), _clamp_0_100(mz)))
-        return planned
+        return to_map_path_3d(path_idx, nx, ny_h, nz)
 
     nx, nz = model.grid_shape
     if nx < 2 or nz < 2:
@@ -540,12 +781,15 @@ def build_q_learning_path(
     if start is None:
         return []
 
-    if not np.isfinite(model.distance_map[start[0], start[1]]):
-        return []
-
     if len(model.goal_idx) != 2:
         return []
     gx, gy = model.goal_idx
+    if not np.isfinite(model.distance_map[start[0], start[1]]):
+        tail = _astar_path_indices_2d(model.free_mask, start, (gx, gy), model.actions)
+        if not tail:
+            return []
+        return to_map_path_2d(tail, nx, nz, float(start_xyz[2]), float(end_xyz[2]))
+
     actions_2d = model.actions
 
     path_idx = [start]
@@ -558,58 +802,41 @@ def build_q_learning_path(
             break
 
         a = int(model.policy[cx, cy])
-        if a < 0 or a >= len(actions_2d):
-            return []
-        dx, dy = actions_2d[a]
-        nx_i = cx + dx
-        ny_i = cy + dy
-        if nx_i < 0 or nx_i >= nx or ny_i < 0 or ny_i >= nz:
-            return []
-        if not bool(model.free_mask[nx_i, ny_i]):
-            return []
+        proposed = None
+        if 0 <= a < len(actions_2d):
+            dx, dy = actions_2d[a]
+            nx_i = cx + dx
+            ny_i = cy + dy
+            if (
+                0 <= nx_i < nx
+                and 0 <= ny_i < nz
+                and bool(model.free_mask[nx_i, ny_i])
+                and (nx_i, ny_i) not in visited
+            ):
+                cur_d = float(model.distance_map[cx, cy])
+                next_d = float(model.distance_map[nx_i, ny_i])
+                if math.isfinite(next_d) and next_d < cur_d:
+                    proposed = (nx_i, ny_i)
 
-        cur_d = float(model.distance_map[cx, cy])
-        next_d = float(model.distance_map[nx_i, ny_i])
-        if not math.isfinite(next_d) or next_d >= cur_d:
-            best = None
-            best_d = float("inf")
-            for bdx, bdy in actions_2d:
-                bx = cx + bdx
-                by = cy + bdy
-                if bx < 0 or bx >= nx or by < 0 or by >= nz:
-                    continue
-                if not bool(model.free_mask[bx, by]):
-                    continue
-                bd = float(model.distance_map[bx, by])
-                if not math.isfinite(bd):
-                    continue
-                if bd < best_d:
-                    best_d = bd
-                    best = (bx, by)
-            if best is None or best_d >= cur_d:
+        if proposed is None:
+            proposed = _best_descending_neighbor_2d(model, (cx, cy), visited)
+        if proposed is None:
+            tail = _astar_path_indices_2d(model.free_mask, (cx, cy), (gx, gy), actions_2d)
+            if len(tail) < 2:
                 return []
-            nx_i, ny_i = best
+            path_idx.extend(tail[1:])
+            cx, cy = path_idx[-1]
+            break
 
-        node = (nx_i, ny_i)
-        if node in visited:
-            return []
+        node = proposed
         visited.add(node)
         path_idx.append(node)
         cx, cy = node
 
     if not path_idx or path_idx[-1] != (gx, gy):
-        return []
+        tail = _astar_path_indices_2d(model.free_mask, (cx, cy), (gx, gy), actions_2d)
+        if len(tail) < 2:
+            return []
+        path_idx.extend(tail[1:])
 
-    start_z = float(start_xyz[2])
-    end_z = float(end_xyz[2])
-    n = len(path_idx)
-
-    planned: list[tuple[float, float, float]] = []
-    for i, (ix, iy) in enumerate(path_idx):
-        mx = float(ix) / float(nx - 1) * 100.0
-        my = float(iy) / float(nz - 1) * 100.0
-        t = 0.0 if n <= 1 else float(i) / float(n - 1)
-        mz = (1.0 - t) * start_z + t * end_z
-        planned.append((_clamp_0_100(mx), _clamp_0_100(my), _clamp_0_100(mz)))
-
-    return planned
+    return to_map_path_2d(path_idx, nx, nz, float(start_xyz[2]), float(end_xyz[2]))

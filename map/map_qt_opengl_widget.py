@@ -16,10 +16,12 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QLabel
 
-from algorithm.algorithm_a_star import plan_astar_path_map_xyz
+from algorithm.algorithm_a_star import plan_astar_flight_trajectory, plan_astar_path_map_xyz
 from algorithm.algorithm_q_learning import QLearningModel, train_q_learning_full_map
 from algorithm.algorithm_entrypoints import PATH_ENTRYPOINTS, TRAIN_ENTRYPOINTS
+from algorithm.flight_constraints import FlightConstraints, FlightTrajectory, build_flight_trajectory
 from map.map_terrain_edit import (
+    apply_height_brush,
     derive_heightfield_from_occupancy,
     export_occupancy_csv,
     load_occupancy_csv,
@@ -31,6 +33,8 @@ from map.map_terrain_edit import (
 class RotatingCubeWidget(QOpenGLWidget):
     hover_text_changed = Signal(str)
     edit_state_changed = Signal(bool)
+    terrain_stroke_finished = Signal()
+    feasibility_changed = Signal(str)
 
     def __init__(self, parent=None, terrain_path: str | None = None) -> None:
         super().__init__(parent)
@@ -53,6 +57,20 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._occ_nz = None
         self._undo_stack: list[Any] = []
         self._max_undo_steps = 20
+        self._brush_enabled = False
+        self._brush_radius = 12.0
+        self._brush_strength = 2.0
+        self._brush_direction = 0
+        self._brush_stroke_changed = False
+        self._brush_timer = QTimer(self)
+        self._brush_timer.setInterval(100)
+        self._brush_timer.timeout.connect(self._apply_brush_at_cursor)
+        self._flight_constraints: FlightConstraints | None = None
+        self._flight_trajectory: FlightTrajectory | None = None
+        self._last_plan_polyline: list[tuple[float, float, float]] = []
+        self._nav_elapsed_s = 0.0
+        self._planning_revision = 0
+        self._last_feasibility_message = ""
 
         # World-space terrain extents/origin. X/Y are planar, Z is height.
         self._origin_x = 0.0
@@ -161,6 +179,62 @@ class RotatingCubeWidget(QOpenGLWidget):
     def can_undo_edit(self) -> bool:
         return bool(self._undo_stack) and self._occupancy is not None
 
+    def set_height_brush(self, enabled: bool, radius: float, strength: float) -> None:
+        """Enable circular terrain editing with map-space radius and strength."""
+        self._finish_brush_stroke()
+        self._brush_enabled = bool(enabled)
+        self._brush_radius = max(1.0, min(50.0, float(radius)))
+        self._brush_strength = max(1.0, min(20.0, float(strength)))
+
+    def apply_height_brush_map(self, mx: float, my: float, delta: float) -> bool:
+        """Apply one brush stamp; consecutive stamps form one undo operation."""
+        if self._occupancy is None:
+            return False
+        import numpy as np
+
+        updated = apply_height_brush(self._occupancy, (mx, my), self._brush_radius, delta)
+        if np.array_equal(updated, self._occupancy):
+            return False
+        if not self._brush_stroke_changed:
+            self._push_undo_state()
+        self._brush_stroke_changed = True
+        self._occupancy = updated
+        self._heights = self._derive_heightfield_from_occupancy(updated, self._cell_size)
+        self.stop_navigation()
+        self._nav_path_map_xyz = []
+        self._invalidate_rl_models()
+        self._recompile_display_list_from_current_heights()
+        self.update()
+        return True
+
+    def _apply_brush_at_cursor(self) -> None:
+        if self._brush_direction == 0 or self._hover_pos is None:
+            return
+        picked = self._pick_map_xy_at_screen_pos(self._hover_pos)
+        if picked is not None:
+            self.apply_height_brush_map(*picked, self._brush_strength * self._brush_direction)
+
+    def _finish_brush_stroke(self) -> None:
+        self._brush_timer.stop()
+        self._brush_direction = 0
+        if self._brush_stroke_changed:
+            self._brush_stroke_changed = False
+            self.terrain_stroke_finished.emit()
+
+    def set_flight_constraints(self, constraints: FlightConstraints | None) -> None:
+        """Change planning/trajectory physics; previous training is invalidated."""
+        if constraints == self._flight_constraints:
+            return
+        self._flight_constraints = constraints
+        self._invalidate_rl_models()
+        self._flight_trajectory = None
+        self._last_plan_polyline = []
+        self._nav_total_dist = 0.0
+        self.update()
+
+    def get_last_feasibility_message(self) -> str:
+        return self._last_feasibility_message
+
     def undo_last_edit(self) -> bool:
         if not self.can_undo_edit():
             return False
@@ -206,6 +280,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._gl_ready = True
 
     def set_terrain_path(self, terrain_path: str | None) -> None:
+        self._finish_brush_stroke()
         self._terrain_path = terrain_path
         if not self._gl_ready:
             return
@@ -309,6 +384,8 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._end_map_xyz = None
         self._agent_map_xyz = None
         self._nav_path_map_xyz = []
+        self._flight_trajectory = None
+        self._last_plan_polyline = []
         self._nav_path_cumdist = []
         self._nav_total_dist = 0.0
         self._nav_progress_dist = 0.0
@@ -435,6 +512,8 @@ class RotatingCubeWidget(QOpenGLWidget):
             self._invalidate_rl_models()
         self.stop_navigation()
         self._nav_path_map_xyz = []
+        self._flight_trajectory = None
+        self._last_plan_polyline = []
         self._nav_path_cumdist = []
         self._nav_total_dist = 0.0
         self._nav_progress_dist = 0.0
@@ -452,6 +531,8 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._agent_map_xyz = (nx, ny, nz)
         self.stop_navigation()
         self._nav_path_map_xyz = []
+        self._flight_trajectory = None
+        self._last_plan_polyline = []
         self._nav_path_cumdist = []
         self._nav_total_dist = 0.0
         self._nav_progress_dist = 0.0
@@ -464,6 +545,8 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._agent_map_xyz = self._start_map_xyz
         self.stop_navigation()
         self._nav_path_map_xyz = []
+        self._flight_trajectory = None
+        self._last_plan_polyline = []
         self._nav_path_cumdist = []
         self._nav_total_dist = 0.0
         self._nav_progress_dist = 0.0
@@ -484,6 +567,15 @@ class RotatingCubeWidget(QOpenGLWidget):
         """Return a copy of the latest planned navigation path in map XYZ."""
 
         return list(self._nav_path_map_xyz)
+
+    def get_last_planning_polyline(self) -> list[tuple[float, float, float]]:
+        """Store unsampled corner geometry so replay can reconstruct true arcs."""
+        return list(self._last_plan_polyline)
+
+    def get_navigation_comparison_key(self) -> tuple:
+        c = self._flight_constraints
+        return ('u',) if c is None else ('m', c.max_speed, c.cruise_speed, c.longitudinal_accel,
+                                       c.lateral_accel, c.climb_rate, c.turn_penalty, c.close_turn_penalty)
 
     def replay_navigation_path(self, path: list[tuple[float, float, float]]) -> bool:
         """Replay a previously recorded map-space path."""
@@ -572,6 +664,14 @@ class RotatingCubeWidget(QOpenGLWidget):
 
     def _invalidate_rl_models(self) -> None:
         """Reset all RL model states (call when map or goal changes)."""
+        self.stop_navigation()
+        self._planning_revision += 1
+        self._nav_path_map_xyz = []
+        self._flight_trajectory = None
+        self._last_plan_polyline = []
+        self._nav_path_cumdist = []
+        self._nav_progress_dist = 0.0
+        self._nav_total_dist = 0.0
         for name in list(self._rl_trained):
             self._rl_trained[name] = False
             self._rl_models[name] = None
@@ -586,6 +686,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         self,
         algorithm: str,
         progress_callback: Callable[[int], None] | None = None,
+        train_params: dict[str, float] | None = None,
     ) -> tuple[bool, str]:
         algo = str(algorithm).strip()
         if algo == "A*":
@@ -598,20 +699,68 @@ class RotatingCubeWidget(QOpenGLWidget):
         if self._end_map_xyz is None:
             return (False, f"请先设置终点再训练 {algo}")
 
-        ok, msg, model = train_fn(
-            occupancy=self._occupancy,
-            heights=self._heights,
-            end_map_xyz=self._end_map_xyz,
-            map_to_index=self._map_to_index,
-            progress_callback=progress_callback,
-        )
+        kwargs: dict[str, object] = {
+            "occupancy": self._occupancy,
+            "heights": self._heights,
+            "end_map_xyz": self._end_map_xyz,
+            "map_to_index": self._map_to_index,
+            "progress_callback": progress_callback,
+        }
+        if self._flight_constraints is not None:
+            try:
+                self._flight_constraints.validate()
+                if self._occupancy is None:
+                    return (False, "性能约束需要三维体素地图")
+                from inspect import signature
+                if 'flight_constraints' not in signature(train_fn).parameters:
+                    return (False, f"{algo} 的训练入口尚未支持飞机性能约束")
+            except ValueError as exc:
+                return (False, str(exc))
+            kwargs['flight_constraints'] = self._flight_constraints
+            kwargs['voxel_size'] = self._cell_size
+        # Keep other algorithms untouched; only Q-learning supports these knobs.
+        if algo == "Q-learning" and train_params:
+            if "gamma" in train_params:
+                kwargs["gamma"] = float(train_params["gamma"])
+            if "alpha" in train_params:
+                kwargs["alpha"] = float(train_params["alpha"])
+
+        revision = self._planning_revision
+        ok, msg, model = train_fn(**kwargs)
+        if revision != self._planning_revision:
+            return (False, "训练期间地图、目标或性能参数已改变；请重新训练")
         self._rl_trained[algo] = bool(ok)
         self._rl_models[algo] = model if ok else None
         return (ok, msg)
 
-    def _set_navigation_path(self, planned: list[tuple[float, float, float]]) -> bool:
+    def _set_navigation_path(self, planned: list[tuple[float, float, float]],
+                             trajectory: FlightTrajectory | None = None) -> bool:
+        self.stop_navigation()
+        self._last_feasibility_message = ""
+        self._nav_path_map_xyz = []
+        self._flight_trajectory = None
+        self._nav_total_dist = 0.0
+        self._last_plan_polyline = []
         if not planned or len(planned) < 2:
             return False
+
+        if self._flight_constraints is not None:
+            try:
+                if self._occupancy is None:
+                    raise ValueError("性能约束需要三维体素地图")
+                trajectory = trajectory or build_flight_trajectory(planned, self._occupancy, self._cell_size, self._flight_constraints)
+            except ValueError as exc:
+                self._last_feasibility_message = str(exc)
+                self.feasibility_changed.emit(str(exc))
+                self.update()
+                return False
+            self._flight_trajectory = trajectory
+            self._last_plan_polyline = list(trajectory.polyline_map)
+            planned = trajectory.samples_map()
+            self._last_feasibility_message = f"性能约束已参与规划：r={self._flight_constraints.turn_radius:.3f} m，圆弧轨迹长={trajectory.length:.3f} m"
+            self.feasibility_changed.emit(self._last_feasibility_message)
+        else:
+            self._last_plan_polyline = list(planned)
 
         self._nav_path_map_xyz = planned
         self._nav_path_cumdist = [0.0]
@@ -621,8 +770,9 @@ class RotatingCubeWidget(QOpenGLWidget):
             x1, y1, z1 = planned[i]
             acc += math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
             self._nav_path_cumdist.append(acc)
-        self._nav_total_dist = acc
+        self._nav_total_dist = trajectory.length if self._flight_trajectory is not None else acc
         self._nav_progress_dist = 0.0
+        self._nav_elapsed_s = 0.0
         self._agent_map_xyz = planned[0]
 
         self._nav_running = True
@@ -632,22 +782,22 @@ class RotatingCubeWidget(QOpenGLWidget):
         self.update()
         return True
 
-    def start_rl_navigation(self, algorithm: str) -> bool:
+    def start_rl_navigation(self, algorithm: str) -> tuple[bool, str]:
         """Start navigation for any RL algorithm registered in PATH_ENTRYPOINTS."""
         algo = str(algorithm).strip()
         model = self._rl_models.get(algo)
         if not self._rl_trained.get(algo) or model is None:
-            return False
+            return (False, f"{algo} 导航失败：模型不存在或训练状态无效")
+        if self._start_map_xyz is None:
+            return (False, f"{algo} 导航失败：未设置起点")
         if self._end_map_xyz is None:
-            return False
+            return (False, f"{algo} 导航失败：未设置终点")
 
         build_fn = PATH_ENTRYPOINTS.get(algo)
         if build_fn is None:
-            return False
+            return (False, f"{algo} 导航失败：未在 PATH_ENTRYPOINTS 中注册")
 
-        start_xyz = self._agent_map_xyz if self._agent_map_xyz is not None else self._start_map_xyz
-        if start_xyz is None:
-            return False
+        start_xyz = self._start_map_xyz
 
         planned = build_fn(
             model=model,
@@ -656,9 +806,17 @@ class RotatingCubeWidget(QOpenGLWidget):
             map_to_index=self._map_to_index,
         )
         if not planned:
-            return False
-        planned = self._optimize_rl_path(planned)
-        return self._set_navigation_path(planned)
+            return (False, f"{algo} 导航失败：路径构造返回空路径；请检查起点、终点或重新训练后再试")
+        if self._flight_constraints is None:
+            planned = self._optimize_rl_path(planned)
+        if not planned or len(planned) < 2:
+            return (False, f"{algo} 导航失败：路径优化后不足两个有效路径点")
+
+        ok = self._set_navigation_path(planned)
+        if not ok:
+            return (False, f"{algo} 导航失败：{self._last_feasibility_message or '导航路径写入播放器失败'}")
+
+        return (True, f"{algo} 导航已开始（起点来源：设定起点）")
 
     def stop_navigation(self) -> None:
         self._nav_running = False
@@ -669,6 +827,22 @@ class RotatingCubeWidget(QOpenGLWidget):
     def start_astar_navigation(self) -> bool:
         if self._start_map_xyz is None or self._end_map_xyz is None:
             return False
+
+        if self._flight_constraints is not None:
+            try:
+                trajectory = plan_astar_flight_trajectory(self._start_map_xyz, self._end_map_xyz,
+                                                         self._occupancy, self._cell_size, self._flight_constraints)
+            except ValueError as exc:
+                self.stop_navigation()
+                self._flight_trajectory = None
+                self._nav_path_map_xyz = []
+                self._last_plan_polyline = []
+                self._nav_total_dist = 0.0
+                self._last_feasibility_message = str(exc)
+                self.feasibility_changed.emit(str(exc))
+                self.update()
+                return False
+            return self._set_navigation_path(trajectory.samples_map(), trajectory)
 
         planned = plan_astar_path_map_xyz(
             self._start_map_xyz,
@@ -684,6 +858,8 @@ class RotatingCubeWidget(QOpenGLWidget):
         return self._set_navigation_path(planned)
 
     def _sample_nav_position(self, dist: float) -> tuple[float, float, float]:
+        if self._flight_trajectory is not None:
+            return self._flight_trajectory.position_map(max(0.0, min(dist, self._nav_total_dist)))
         if not self._nav_path_map_xyz:
             return (0.0, 0.0, 0.0)
         if dist <= 0.0:
@@ -721,7 +897,11 @@ class RotatingCubeWidget(QOpenGLWidget):
         dt = max(0.0, now - self._nav_last_time_s)
         self._nav_last_time_s = now
 
-        self._nav_progress_dist += float(self._nav_speed_units_per_sec) * dt
+        self._nav_elapsed_s += dt
+        if self._flight_trajectory is not None:
+            self._nav_progress_dist = self._flight_trajectory.constraints.distance_at_time(self._nav_elapsed_s)
+        else:
+            self._nav_progress_dist += float(self._nav_speed_units_per_sec) * dt
         if self._nav_progress_dist >= self._nav_total_dist:
             self._nav_progress_dist = self._nav_total_dist
             self._agent_map_xyz = self._nav_path_map_xyz[-1]
@@ -1466,6 +1646,21 @@ class RotatingCubeWidget(QOpenGLWidget):
         self._update_pin_labels()
         self._update_trace_labels(gl, glu)
 
+        if self._brush_enabled and self._last_hover_map_xy is not None:
+            mx, my = self._last_hover_map_xy
+            gl.glColor3f(1.0, 0.85, 0.2)
+            gl.glLineWidth(2.0)
+            gl.glBegin(gl.GL_LINE_LOOP)
+            for i in range(64):
+                angle = 2 * math.pi * i / 64
+                bx = max(0.0, min(100.0, mx + self._brush_radius * math.cos(angle)))
+                by = max(0.0, min(100.0, my + self._brush_radius * math.sin(angle)))
+                wx = self._origin_x + bx * self._extent_x / 100
+                wy = self._origin_y + by * self._extent_y / 100
+                gl.glVertex3f(wx, wy, self._terrain_height_at_map(bx, by) + self._cell_size * 0.15)
+            gl.glEnd()
+            gl.glLineWidth(1.0)
+
     def _draw_origin_axes(self, gl) -> None:
         """Draw XYZ axes at the map origin (terrain corner) in world coordinates."""
 
@@ -1772,6 +1967,13 @@ class RotatingCubeWidget(QOpenGLWidget):
 
     def mousePressEvent(self, event):  # type: ignore[override]
         self.setFocus()
+        if self._brush_enabled and event.button() in (Qt.LeftButton, Qt.RightButton):
+            self._hover_pos = event.position()
+            self._brush_direction = 1 if event.button() == Qt.LeftButton else -1
+            self._apply_brush_at_cursor()
+            self._brush_timer.start()
+            event.accept()
+            return
         self._press_pos = event.position()
         self._press_button = event.button()
         self._press_dragged = False
@@ -1789,6 +1991,10 @@ class RotatingCubeWidget(QOpenGLWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):  # type: ignore[override]
+        if self._brush_enabled and event.button() in (Qt.LeftButton, Qt.RightButton):
+            self._finish_brush_stroke()
+            event.accept()
+            return
         # Click actions (pin / delete) are recognized on release if the mouse didn't drag.
         if self._press_pos is not None and not self._press_dragged:
             if self._press_button == Qt.LeftButton:
@@ -1843,6 +2049,11 @@ class RotatingCubeWidget(QOpenGLWidget):
 
     def mouseMoveEvent(self, event):  # type: ignore[override]
         self._hover_pos = event.position()
+
+        if self._brush_enabled and self._brush_direction != 0:
+            self.update()
+            event.accept()
+            return
 
         if self._press_pos is not None and not self._press_dragged:
             dxp = float(event.position().x() - self._press_pos.x())

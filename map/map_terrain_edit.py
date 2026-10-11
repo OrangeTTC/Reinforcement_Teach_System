@@ -8,6 +8,51 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
+
+
+def apply_height_brush(
+    occupancy: np.ndarray,
+    center_xy: tuple[float, float],
+    radius: float,
+    delta_height: float,
+) -> np.ndarray:
+    """Return terrain raised/lowered by a smooth circular map-space brush.
+
+    The array axes are (x, height, planar_y). Radius and height changes use
+    map coordinates [0,100]. Only affected columns are edited; terrain is
+    filled below its new surface, with a ground layer retained at height zero.
+    """
+    import numpy as np
+
+    occ = np.asarray(occupancy)
+    values = np.asarray([*center_xy, radius, delta_height], dtype=float)
+    if occ.ndim != 3 or min(occ.shape) < 2 or not np.isfinite(values).all() or radius <= 0:
+        raise ValueError("Invalid occupancy or height brush parameters")
+    nx, ny_h, nz = occ.shape
+    xs = np.linspace(0, 100, nx)[:, None]
+    ys = np.linspace(0, 100, nz)[None, :]
+    distance = np.hypot(xs - center_xy[0], ys - center_xy[1]) / radius
+    mask = distance < 1
+    if not mask.any() or delta_height == 0:
+        return occ.copy()
+    # Cosine falloff avoids a sharp cylindrical edge.
+    weight = 0.5 * (1 + np.cos(np.pi * np.clip(distance, 0, 1)))
+    heights = np.where(occ != 0, np.arange(ny_h)[None, :, None], -1).max(axis=1)
+    changes = np.rint(weight * abs(delta_height) * (ny_h - 1) / 100).astype(int)
+    changes *= 1 if delta_height > 0 else -1
+    new_heights = np.clip(heights + changes, 0, ny_h - 1)
+    result = occ.copy()
+    for ix, iz in np.argwhere(mask & (changes != 0)):
+        if delta_height > 0:
+            result[ix, : int(new_heights[ix, iz]) + 1, iz] = 1
+        else:
+            result[ix, int(new_heights[ix, iz]) + 1 :, iz] = 0
+            result[ix, 0, iz] = 1
+    return result
 
 
 def derive_heightfield_from_occupancy(occ, voxel_size: float):

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from algorithm.algorithm_q_learning import QLearningModel, train_q_learning_full_map
+from algorithm.flight_constraints import FlightConstraints, build_flight_policy_path, copy_flight_context
 
 
 @dataclass
@@ -29,6 +30,9 @@ class DQNModel:
     is_3d: bool
     actions: tuple[tuple[int, ...], ...]
     distance_map: object
+    flight_constraints: FlightConstraints | None = None
+    flight_voxel_size: float = 1.0
+    flight_valid_moves: object = None
 
 
 def _relu(x):
@@ -187,6 +191,8 @@ def train_dqn_full_map(
     end_map_xyz: tuple[float, float, float] | None,
     map_to_index: Callable[[float, int, str], int],
     progress_callback: Callable[[int], None] | None = None,
+    flight_constraints: FlightConstraints | None = None,
+    voxel_size: float = 1.0,
 ) -> tuple[bool, str, DQNModel | None]:
     """Train DQN policy on full map.
 
@@ -209,6 +215,8 @@ def train_dqn_full_map(
         end_map_xyz=end_map_xyz,
         map_to_index=map_to_index,
         progress_callback=teacher_progress,
+        flight_constraints=flight_constraints,
+        voxel_size=voxel_size,
     )
     if not ok or teacher_model is None:
         return (False, "DQN training failed: cannot build teacher targets", None)
@@ -334,6 +342,7 @@ def train_dqn_full_map(
         distance_map=distance_map,
     )
 
+    copy_flight_context(model, teacher_model)
     if progress_callback is not None:
         progress_callback(100)
 
@@ -350,6 +359,8 @@ def build_dqn_path(
     end_xyz: tuple[float, float, float],
     map_to_index: Callable[[float, int, str], int],
 ) -> list[tuple[float, float, float]]:
+    if model.flight_constraints is not None:
+        return build_flight_policy_path(model, start_xyz, end_xyz)
     import numpy as np
 
     _ = end_xyz

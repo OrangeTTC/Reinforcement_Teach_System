@@ -14,6 +14,8 @@ of truth for where each algorithm's train/build-path functions are defined.
 
 from typing import Any, Callable
 
+from algorithm.flight_constraints import FlightConstraints
+
 from algorithm.algorithm_dqn import build_dqn_path, train_dqn_full_map
 from algorithm.algorithm_her import build_her_path, train_her_full_map
 from algorithm.algorithm_ppo import build_ppo_path, train_ppo_full_map
@@ -40,6 +42,10 @@ def _train_q_learning_normalized(
     end_map_xyz: tuple[float, float, float] | None,
     map_to_index: Callable[[float, int, str], int],
     progress_callback: Callable[[int], None] | None = None,
+    gamma: float = 0.95,
+    alpha: float = 1.0,
+    flight_constraints: FlightConstraints | None = None,
+    voxel_size: float = 1.0,
 ) -> tuple[bool, str, Any]:
     """Normalized wrapper for Q-learning so it shares the standard train signature."""
     ok, model, episodes, free_cells, goal_idx = train_q_learning_full_map(
@@ -48,6 +54,10 @@ def _train_q_learning_normalized(
         end_map_xyz=end_map_xyz,
         map_to_index=map_to_index,
         progress_callback=progress_callback,
+        gamma=gamma,
+        alpha=alpha,
+        flight_constraints=flight_constraints,
+        voxel_size=voxel_size,
     )
     if not ok or model is None:
         return (False, "Q-learning 训练失败（无效地图或无法到达目标点）", None)

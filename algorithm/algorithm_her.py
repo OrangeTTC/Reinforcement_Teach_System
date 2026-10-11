@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from algorithm.algorithm_q_learning import train_q_learning_full_map
+from algorithm.flight_constraints import FlightConstraints, build_flight_policy_path, copy_flight_context
 
 
 @dataclass
@@ -27,6 +28,9 @@ class HERModel:
     is_3d: bool
     actions: tuple[tuple[int, ...], ...]
     distance_map: object
+    flight_constraints: FlightConstraints | None = None
+    flight_voxel_size: float = 1.0
+    flight_valid_moves: object = None
 
 
 def _clamp_0_100(v: float) -> float:
@@ -189,6 +193,17 @@ def _nearest_free_from_model(model: HERModel, start_idx):
 
 
 def _teacher_step(model, node, visited):
+    if getattr(model, 'flight_constraints', None) is not None:
+        import numpy as np
+        best, best_score = None, -math.inf
+        for a in np.flatnonzero(model.flight_valid_moves[(slice(None),) + node]):
+            nxt = tuple(c + d for c, d in zip(node, model.actions[a]))
+            if nxt in visited or model.distance_map[nxt] >= model.distance_map[node] - 1e-9:
+                continue
+            score = float(model.q_table[node + (a,)])
+            if score > best_score:
+                best, best_score = (nxt, int(a)), score
+        return best
     if model.is_3d:
         cx, cy_h, cz = node
         nx, ny_h, nz = model.grid_shape
@@ -253,6 +268,8 @@ def train_her_full_map(
     end_map_xyz: tuple[float, float, float] | None,
     map_to_index: Callable[[float, int, str], int],
     progress_callback: Callable[[int], None] | None = None,
+    flight_constraints: FlightConstraints | None = None,
+    voxel_size: float = 1.0,
 ) -> tuple[bool, str, HERModel | None]:
     """Train HER policy on full map with hindsight relabeling."""
 
@@ -271,6 +288,8 @@ def train_her_full_map(
         end_map_xyz=end_map_xyz,
         map_to_index=map_to_index,
         progress_callback=teacher_progress,
+        flight_constraints=flight_constraints,
+        voxel_size=voxel_size,
     )
     if not ok or teacher_model is None:
         return (False, "HER training failed: cannot build teacher targets", None)
@@ -296,6 +315,8 @@ def train_her_full_map(
     teacher_wrap.distance_map = distance_map
     teacher_wrap.actions = actions
     teacher_wrap.policy = teacher_model.policy
+    teacher_wrap.q_table = teacher_model.q_table
+    copy_flight_context(teacher_wrap, teacher_model)
 
     # Base dataset: all states with true goal and teacher action.
     states = []
@@ -429,6 +450,7 @@ def train_her_full_map(
         if progress_callback is not None and ((ep + 1) % max(1, epochs // 35) == 0 or ep + 1 == epochs):
             progress_callback(65 + int((ep + 1) * 35 / epochs))
 
+    copy_flight_context(model, teacher_model)
     if progress_callback is not None:
         progress_callback(100)
 
@@ -445,6 +467,11 @@ def build_her_path(
     end_xyz: tuple[float, float, float],
     map_to_index: Callable[[float, int, str], int],
 ) -> list[tuple[float, float, float]]:
+    if model.flight_constraints is not None:
+        def scores(node):
+            inputs = _state_goal_features([node], [model.goal_idx], model.grid_shape, True)
+            return _forward(model, inputs)[2][0]
+        return build_flight_policy_path(model, start_xyz, end_xyz, scores)
     import numpy as np
 
     _ = end_xyz

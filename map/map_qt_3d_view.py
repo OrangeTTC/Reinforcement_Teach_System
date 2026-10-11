@@ -6,6 +6,7 @@ License: Apache-2.0
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from time import perf_counter
 
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QHeaderView,
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QProgressBar,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QSpinBox,
@@ -31,9 +34,13 @@ from PySide6.QtWidgets import (
 )
 
 from algorithm.algorithm_entrypoints import TRAIN_ENTRYPOINTS
+from algorithm.flight_constraints import FlightConstraints
 
 # Algorithm names shown in the combo box: A* first (search-based), then all RL algorithms.
 _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
+
+
+class ThreeDWindow(QMainWindow):
     """A minimal in-window 3D animation using QOpenGLWidget + PyOpenGL."""
 
     def __init__(self, terrain_path: str | None = None) -> None:
@@ -250,6 +257,30 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
         algo_row_layout.addWidget(algo_select_row)
         algo_row_layout.addWidget(algo_train_row)
 
+        # Q-learning hyperparameters (shown only when Q-learning is selected).
+        self.qlearn_alpha_edit = QLineEdit()
+        self.qlearn_alpha_edit.setPlaceholderText("α")
+        self.qlearn_alpha_edit.setFixedWidth(72)
+        self.qlearn_alpha_edit.setText(str(self._settings.value("qlearn/alpha", "1.0")))
+
+        self.qlearn_gamma_edit = QLineEdit()
+        self.qlearn_gamma_edit.setPlaceholderText("γ")
+        self.qlearn_gamma_edit.setFixedWidth(72)
+        self.qlearn_gamma_edit.setText(str(self._settings.value("qlearn/gamma", "0.95")))
+
+        self.qlearn_param_row = QWidget()
+        qlearn_param_layout = QHBoxLayout(self.qlearn_param_row)
+        qlearn_param_layout.setContentsMargins(0, 0, 0, 0)
+        qlearn_param_layout.setSpacing(8)
+        qlearn_param_layout.addWidget(QLabel("Q-learning 参数"))
+        qlearn_param_layout.addWidget(QLabel("学习率α"))
+        qlearn_param_layout.addWidget(self.qlearn_alpha_edit)
+        qlearn_param_layout.addWidget(QLabel("衰减γ"))
+        qlearn_param_layout.addWidget(self.qlearn_gamma_edit)
+        qlearn_param_layout.addStretch(1)
+
+        algo_row_layout.addWidget(self.qlearn_param_row)
+
         terrain_row = QWidget()
         terrain_row_layout = QVBoxLayout(terrain_row)
         terrain_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -422,6 +453,22 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
         edit_layout.addWidget(self._cuboid_row_2)
         edit_layout.addWidget(self._cylinder_row)
         edit_layout.addWidget(row_actions)
+        self.brush_checkbox = QCheckBox("地形刷子（左键升高 / 右键降低）")
+        self.brush_checkbox.setToolTip("启用后拖动或按住鼠标修改地形；中键平移、滚轮缩放。关闭后可用左键旋转视角。")
+        self.brush_radius = QSpinBox()
+        self.brush_radius.setRange(1, 50)
+        self.brush_radius.setValue(12)
+        self.brush_strength = QSpinBox()
+        self.brush_strength.setRange(1, 20)
+        self.brush_strength.setValue(2)
+        brush_row = QHBoxLayout()
+        brush_row.addWidget(QLabel("半径"))
+        brush_row.addWidget(self.brush_radius)
+        brush_row.addWidget(QLabel("强度"))
+        brush_row.addWidget(self.brush_strength)
+        brush_row.addWidget(QLabel("地图单位"))
+        edit_layout.addWidget(self.brush_checkbox)
+        edit_layout.addLayout(brush_row)
         edit_layout.addWidget(row_status)
 
         # --- Tracing start/end inputs ---
@@ -504,8 +551,9 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
         metrics_layout.setSpacing(6)
         metrics_layout.addWidget(QLabel("性能指标"))
 
-        self.metrics_table = QTableWidget(0, 5)
-        self.metrics_table.setHorizontalHeaderLabels(["运行", "算法", "训练时间", "导航路径长度", "导航时间"])
+        self.metrics_table = QTableWidget(0, 6)
+        self.metrics_table.setHorizontalHeaderLabels(["排名", "运行", "算法", "训练时间", "导航路径长度", "导航时间"])
+        self.metrics_table.horizontalHeaderItem(0).setToolTip("约束开关和性能参数相同的记录分别排名")
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setMinimumHeight(170)
         self.metrics_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -518,10 +566,82 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
         hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(4, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(5, QHeaderView.Stretch)
 
         def fmt_metric(v: float) -> str:
             return f"{float(v):.3f}"
+
+        def _is_successful_record(item: dict[str, object]) -> bool:
+            path = item.get("path", [])
+            if not isinstance(path, list):
+                return False
+            return len(path) >= 2 and float(item.get("navigate_length", 0.0) or 0.0) > 0.0
+
+        def _recompute_ranking() -> None:
+            """Compute score/rank and keep history sorted by rank.
+
+            Score is a dimensionless sum of normalized navigation time and path length:
+            score = (t / t_best) + (L / L_best), smaller is better.
+            """
+
+            valid = [m for m in self._metrics_history if _is_successful_record(m)]
+
+            for m in self._metrics_history:
+                if _is_successful_record(m):
+                    comparable = [v for v in valid if v.get('comparison_key', ('u',)) == m.get('comparison_key', ('u',))]
+                    best_time = max(1e-9, min((float(v['navigate_time']) for v in comparable if float(v['navigate_time']) > 0), default=1.0))
+                    best_len = max(1e-9, min((float(v['navigate_length']) for v in comparable if float(v['navigate_length']) > 0), default=1.0))
+                    t = float(m.get("navigate_time", 0.0) or 0.0)
+                    L = float(m.get("navigate_length", 0.0) or 0.0)
+                    m["score"] = (t / best_time) + (L / best_len)
+                else:
+                    m["score"] = float("inf")
+
+            self._metrics_history.sort(
+                key=lambda m: (
+                    float(m.get("score", float("inf")) or float("inf")),
+                    int(m.get("run", 0) or 0),
+                )
+            )
+
+            ranks: dict[tuple, int] = {}
+            for m in self._metrics_history:
+                score = float(m.get("score", float("inf")) or float("inf"))
+                if math.isfinite(score):
+                    key = tuple(m.get('comparison_key', ('u',)))
+                    ranks[key] = ranks.get(key, 0) + 1
+                    m["rank"] = ranks[key]
+                else:
+                    m["rank"] = None
+
+        def _refresh_metrics_table(select_run: int | None = None) -> None:
+            _recompute_ranking()
+
+            self.metrics_table.setRowCount(0)
+            for row, m in enumerate(self._metrics_history):
+                self.metrics_table.insertRow(row)
+
+                rank_val = m.get("rank")
+                rank_text = str(rank_val) if isinstance(rank_val, int) else "-"
+
+                self.metrics_table.setItem(row, 0, QTableWidgetItem(rank_text))
+                self.metrics_table.setItem(row, 1, QTableWidgetItem(str(int(m.get("run", 0) or 0))))
+                self.metrics_table.setItem(row, 2, QTableWidgetItem(str(m.get("algorithm", ""))))
+                self.metrics_table.setItem(row, 3, QTableWidgetItem(fmt_metric(float(m.get("training_time", 0.0) or 0.0))))
+                self.metrics_table.setItem(row, 4, QTableWidgetItem(fmt_metric(float(m.get("navigate_length", 0.0) or 0.0)) + ' ' + str(m.get('length_unit', 'u'))))
+                self.metrics_table.setItem(row, 5, QTableWidgetItem(fmt_metric(float(m.get("navigate_time", 0.0) or 0.0))))
+
+            if select_run is None:
+                return
+
+            for row, m in enumerate(self._metrics_history):
+                if int(m.get("run", 0) or 0) == int(select_run):
+                    it = self.metrics_table.item(row, 0)
+                    if it is not None:
+                        self.metrics_table.setCurrentCell(row, 0)
+                        self.metrics_table.scrollToItem(it)
+                    break
 
         def append_metric_log(
             algo_name: str,
@@ -531,24 +651,21 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
             path: list[tuple[float, float, float]] | None = None,
         ) -> None:
             self._run_counter += 1
-            row = self.metrics_table.rowCount()
-            self.metrics_table.insertRow(row)
-            self.metrics_table.setItem(row, 0, QTableWidgetItem(str(self._run_counter)))
-            self.metrics_table.setItem(row, 1, QTableWidgetItem(algo_name))
-            self.metrics_table.setItem(row, 2, QTableWidgetItem(fmt_metric(training_time)))
-            self.metrics_table.setItem(row, 3, QTableWidgetItem(fmt_metric(navigate_length)))
-            self.metrics_table.setItem(row, 4, QTableWidgetItem(fmt_metric(navigate_time)))
+            run_no = int(self._run_counter)
             self._metrics_history.append(
                 {
-                    "run": self._run_counter,
+                    "run": run_no,
                     "algorithm": algo_name,
                     "training_time": float(training_time),
                     "navigate_length": float(navigate_length),
                     "navigate_time": float(navigate_time),
                     "path": list(path) if path else [],
+                    "planning_path": self._gl.get_last_planning_polyline() if path else [],
+                    "comparison_key": self._gl.get_navigation_comparison_key(),
+                    "length_unit": self._gl.get_navigation_comparison_key()[0],
                 }
             )
-            self.metrics_table.scrollToBottom()
+            _refresh_metrics_table(select_run=run_no)
 
         def on_metrics_row_clicked(row: int, _column: int) -> None:
             if row < 0 or row >= len(self._metrics_history):
@@ -556,7 +673,7 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
                 return
 
             item = self._metrics_history[row]
-            path = list(item.get("path", []))
+            path = list(item.get("planning_path") or item.get("path", []))
             if not path:
                 self.trace_status.setText("此次运行没有轨迹记录")
                 return
@@ -566,7 +683,7 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
                 run_no = int(item.get("run", 0))
                 self.trace_status.setText(f"正在回放第 {run_no} 次运行 ({algo_name})")
             else:
-                self.trace_status.setText("选中运行的回放失败")
+                self.trace_status.setText(self._gl.get_last_feasibility_message() or "选中运行的回放失败")
 
         def on_delete_selected_history() -> None:
             row = self.metrics_table.currentRow()
@@ -574,9 +691,9 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
                 self.trace_status.setText("请选择要删除的历史行")
                 return
 
-            self.metrics_table.removeRow(row)
             if 0 <= row < len(self._metrics_history):
                 self._metrics_history.pop(row)
+            _refresh_metrics_table()
             self.trace_status.setText("已删除选中历史")
 
         def on_clear_history() -> None:
@@ -635,11 +752,81 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
         trace_layout.addWidget(row_trace_actions)
         trace_layout.addWidget(row_trace_hint)
 
+        self.constraints_checkbox = QCheckBox("启用飞机性能约束（参与规划）")
+        def performance_control(value: float, suffix: str, allow_zero: bool = False) -> QDoubleSpinBox:
+            control = QDoubleSpinBox()
+            control.setRange(0 if allow_zero else 0.01, 1000)
+            control.setDecimals(2)
+            control.setSingleStep(0.1)
+            control.setValue(value)
+            control.setSuffix(suffix)
+            control.setEnabled(False)
+            return control
+        self.max_speed_limit = performance_control(12, " m/s")
+        self.cruise_speed = performance_control(5, " m/s")
+        self.longitudinal_accel = performance_control(2, " m/s²")
+        self.lateral_accel = performance_control(8, " m/s²")
+        self.climb_rate = performance_control(2, " m/s")
+        self.turn_penalty = performance_control(0.15, "", True)
+        self.close_turn_penalty = performance_control(0.30, "", True)
+        performance_fields = [("最大速度", self.max_speed_limit), ("巡航速度 v", self.cruise_speed),
+                              ("纵向加速度", self.longitudinal_accel), ("横向加速度", self.lateral_accel),
+                              ("爬升/下降速率", self.climb_rate), ("转弯惩罚", self.turn_penalty),
+                              ("近距离转弯惩罚", self.close_turn_penalty)]
+        self.feasibility_status = QLabel("性能约束关闭；回放速度采用地图单位 u/s")
+        self.feasibility_status.setWordWrap(True)
+        trace_layout.addWidget(self.constraints_checkbox)
+        for i in range(0, len(performance_fields), 2):
+            row = QHBoxLayout()
+            for label, control in performance_fields[i:i+2]:
+                row.addWidget(QLabel(label))
+                row.addWidget(control)
+            trace_layout.addLayout(row)
+        trace_layout.addWidget(self.feasibility_status)
+
         self._gl = RotatingCubeWidget(self, terrain_path=resolved_path)
         self._gl.setMinimumWidth(620)
         self._gl.hover_text_changed.connect(self.xyz_label.setText)
         self._gl.edit_state_changed.connect(self.undo_button.setEnabled)
+        self._gl.feasibility_changed.connect(self.feasibility_status.setText)
         self.axes_checkbox.toggled.connect(self._gl.set_show_axes)
+
+        def update_brush() -> None:
+            self._gl.set_height_brush(self.brush_checkbox.isChecked(), self.brush_radius.value(), self.brush_strength.value())
+
+        def on_brush_finished() -> None:
+            saved = persist_active_terrain()
+            self.edit_status.setText("刷子编辑已保存" if saved else "刷子编辑完成（保存失败）")
+            update_navigation_ui()
+
+        def update_constraints() -> None:
+            enabled = self.constraints_checkbox.isChecked()
+            config = FlightConstraints(max_speed=self.max_speed_limit.value(), cruise_speed=self.cruise_speed.value(),
+                                       longitudinal_accel=self.longitudinal_accel.value(), lateral_accel=self.lateral_accel.value(),
+                                       climb_rate=self.climb_rate.value(), turn_penalty=self.turn_penalty.value(),
+                                       close_turn_penalty=self.close_turn_penalty.value()) if enabled else None
+            self._gl.set_flight_constraints(config)
+            for _, control in performance_fields:
+                control.setEnabled(enabled)
+            self.navigate_speed.setEnabled(not enabled)
+            self.navigate_speed.setToolTip("性能约束开启时，回放使用巡航速度及启动加速度" if enabled else "地图单位/秒")
+            if config is None:
+                self.feasibility_status.setText("性能约束关闭；回放速度采用地图单位 u/s")
+            else:
+                try:
+                    config.validate()
+                    self.feasibility_status.setText(f"r=v²/a横={config.turn_radius:.3f} m；规划与训练使用膨胀地图和爬升限制；参数变化需重新训练。voxel_size 按米解释。")
+                except ValueError as exc:
+                    self.feasibility_status.setText(str(exc))
+            update_navigation_ui()
+
+        self.brush_checkbox.toggled.connect(update_brush)
+        self.brush_radius.valueChanged.connect(update_brush)
+        self.brush_strength.valueChanged.connect(update_brush)
+        self._gl.terrain_stroke_finished.connect(on_brush_finished)
+        self.constraints_checkbox.toggled.connect(update_constraints)
+        for _, control in performance_fields:
+            control.valueChanged.connect(update_constraints)
 
         def update_shape_ui() -> None:
             is_cuboid = self.shape_combo.currentText() == "长方体"
@@ -760,15 +947,17 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
             algo = self.algo_combo.currentText().strip()
             is_astar = algo == "A*"
             is_rl = algo in {"Q-learning", "DQN", "PPO", "HER"}
+            is_qlearn = algo == "Q-learning"
 
             self.train_algo_button.setVisible(is_rl)
             self.algo_progress.setVisible(is_rl)
+            self.qlearn_param_row.setVisible(is_qlearn)
 
             trained = self._gl.is_algorithm_trained(algo)
             can_nav = is_astar or trained
 
             self.navigate_button.setEnabled(can_nav)
-            self.navigate_speed.setEnabled(can_nav)
+            self.navigate_speed.setEnabled(can_nav and not self.constraints_checkbox.isChecked())
 
             if is_astar:
                 self.algo_status.setText("A* 就绪")
@@ -789,7 +978,37 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
                 QApplication.processEvents()
 
             t0 = perf_counter()
-            ok, msg = self._gl.train_navigation_policy(algo, progress_callback=on_progress)
+            if algo == "Q-learning":
+                try:
+                    alpha = float(self.qlearn_alpha_edit.text().strip())
+                    gamma = float(self.qlearn_gamma_edit.text().strip())
+                except Exception:
+                    self.algo_status.setText("Q-learning 参数输入无效")
+                    self.trace_status.setText("Q-learning 参数输入无效")
+                    update_navigation_ui()
+                    return
+
+                if not (0.0 <= alpha <= 1.0):
+                    self.algo_status.setText("学习率α需在[0,1]范围内")
+                    self.trace_status.setText("学习率α需在[0,1]范围内")
+                    update_navigation_ui()
+                    return
+                if not (0.0 <= gamma < 1.0):
+                    self.algo_status.setText("衰减γ需在[0,1)范围内")
+                    self.trace_status.setText("衰减γ需在[0,1)范围内")
+                    update_navigation_ui()
+                    return
+
+                self._settings.setValue("qlearn/alpha", f"{alpha:g}")
+                self._settings.setValue("qlearn/gamma", f"{gamma:g}")
+
+                ok, msg = self._gl.train_navigation_policy(
+                    algo,
+                    progress_callback=on_progress,
+                    train_params={"alpha": alpha, "gamma": gamma},
+                )
+            else:
+                ok, msg = self._gl.train_navigation_policy(algo, progress_callback=on_progress)
             train_elapsed = perf_counter() - t0
 
             # A* does not require training.
@@ -813,10 +1032,11 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
                 t0 = perf_counter()
                 ok = self._gl.start_astar_navigation()
                 nav_elapsed = perf_counter() - t0
-                nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-                nav_path = self._gl.get_last_navigation_path() if ok else []
-                append_metric_log(algo, 0.0, nav_length, float(nav_elapsed), nav_path)
-                self.trace_status.setText("A* 导航已开始" if ok else "A* 失败：请设置有效起终点及可通行路径")
+                if ok:
+                    nav_length = float(self._gl.get_last_navigation_length())
+                    nav_path = self._gl.get_last_navigation_path()
+                    append_metric_log(algo, 0.0, nav_length, float(nav_elapsed), nav_path)
+                self.trace_status.setText("A* 导航已开始" if ok else (self._gl.get_last_feasibility_message() or "A* 失败：请设置有效起终点及可通行路径"))
                 return
 
             # All RL algorithms are handled generically via the registry.
@@ -824,12 +1044,13 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
                 self.trace_status.setText(f"{algo} 未训练")
                 return
             t0 = perf_counter()
-            ok = self._gl.start_rl_navigation(algo)
+            ok, nav_msg = self._gl.start_rl_navigation(algo)
             nav_elapsed = perf_counter() - t0
-            nav_length = float(self._gl.get_last_navigation_length()) if ok else 0.0
-            nav_path = self._gl.get_last_navigation_path() if ok else []
-            append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
-            self.trace_status.setText(f"{algo} 导航已开始" if ok else f"{algo} 失败：请重新训练或重置起终点")
+            if ok:
+                nav_length = float(self._gl.get_last_navigation_length())
+                nav_path = self._gl.get_last_navigation_path()
+                append_metric_log(algo, float(self._algo_training_time.get(algo, 0.0)), nav_length, float(nav_elapsed), nav_path)
+            self.trace_status.setText(nav_msg)
 
         def on_speed_changed(value: int) -> None:
             # Apply speed immediately so running navigation changes speed in real time.
@@ -880,7 +1101,14 @@ _ALGO_NAMES: list[str] = ["A*"] + list(TRAIN_ENTRYPOINTS.keys())
         left_layout.addWidget(metrics_bar)
         left_layout.addStretch(1)
 
-        main_layout.addWidget(left_panel, stretch=0)
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setFrameShape(QFrame.NoFrame)
+        self.controls_scroll.setMinimumWidth(400)
+        self.controls_scroll.setMaximumWidth(480)
+        self.controls_scroll.setWidget(left_panel)
+        main_layout.addWidget(self.controls_scroll, stretch=0)
         main_layout.addWidget(self._gl, stretch=1)
 
         self.setCentralWidget(root)
