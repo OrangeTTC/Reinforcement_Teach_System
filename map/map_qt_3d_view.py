@@ -551,9 +551,10 @@ class ThreeDWindow(QMainWindow):
         metrics_layout.setSpacing(6)
         metrics_layout.addWidget(QLabel("性能指标"))
 
-        self.metrics_table = QTableWidget(0, 6)
-        self.metrics_table.setHorizontalHeaderLabels(["排名", "运行", "算法", "训练时间", "导航路径长度", "导航时间"])
+        self.metrics_table = QTableWidget(0, 7)
+        self.metrics_table.setHorizontalHeaderLabels(["排名", "运行", "算法", "训练时间(s)", "路径长度", "计算耗时(s)", "路径运行时间(s)"])
         self.metrics_table.horizontalHeaderItem(0).setToolTip("约束开关和性能参数相同的记录分别排名")
+        self.metrics_table.horizontalHeaderItem(6).setToolTip("由最终轨迹速度曲线积分得到的运动时间，含加速、转弯减速、爬升限速及终点制动；不含训练或路径计算时间")
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setMinimumHeight(170)
         self.metrics_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -567,7 +568,8 @@ class ThreeDWindow(QMainWindow):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(5, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeToContents)
 
         def fmt_metric(v: float) -> str:
             return f"{float(v):.3f}"
@@ -590,9 +592,9 @@ class ThreeDWindow(QMainWindow):
             for m in self._metrics_history:
                 if _is_successful_record(m):
                     comparable = [v for v in valid if v.get('comparison_key', ('u',)) == m.get('comparison_key', ('u',))]
-                    best_time = max(1e-9, min((float(v['navigate_time']) for v in comparable if float(v['navigate_time']) > 0), default=1.0))
+                    best_time = max(1e-9, min((float(v['flight_time']) for v in comparable if float(v['flight_time']) > 0), default=1.0))
                     best_len = max(1e-9, min((float(v['navigate_length']) for v in comparable if float(v['navigate_length']) > 0), default=1.0))
-                    t = float(m.get("navigate_time", 0.0) or 0.0)
+                    t = float(m.get("flight_time", 0.0) or 0.0)
                     L = float(m.get("navigate_length", 0.0) or 0.0)
                     m["score"] = (t / best_time) + (L / best_len)
                 else:
@@ -631,6 +633,7 @@ class ThreeDWindow(QMainWindow):
                 self.metrics_table.setItem(row, 3, QTableWidgetItem(fmt_metric(float(m.get("training_time", 0.0) or 0.0))))
                 self.metrics_table.setItem(row, 4, QTableWidgetItem(fmt_metric(float(m.get("navigate_length", 0.0) or 0.0)) + ' ' + str(m.get('length_unit', 'u'))))
                 self.metrics_table.setItem(row, 5, QTableWidgetItem(fmt_metric(float(m.get("navigate_time", 0.0) or 0.0))))
+                self.metrics_table.setItem(row, 6, QTableWidgetItem(fmt_metric(float(m.get("flight_time", 0.0) or 0.0))))
 
             if select_run is None:
                 return
@@ -659,8 +662,10 @@ class ThreeDWindow(QMainWindow):
                     "training_time": float(training_time),
                     "navigate_length": float(navigate_length),
                     "navigate_time": float(navigate_time),
+                    "flight_time": self._gl.get_last_navigation_duration() if path else 0.0,
                     "path": list(path) if path else [],
                     "planning_path": self._gl.get_last_planning_polyline() if path else [],
+                    "trajectory": self._gl.get_last_flight_trajectory() if path else None,
                     "comparison_key": self._gl.get_navigation_comparison_key(),
                     "length_unit": self._gl.get_navigation_comparison_key()[0],
                 }
@@ -678,7 +683,10 @@ class ThreeDWindow(QMainWindow):
                 self.trace_status.setText("此次运行没有轨迹记录")
                 return
 
-            if self._gl.replay_navigation_path(path):
+            if item.get('comparison_key') != self._gl.get_navigation_comparison_key():
+                self.trace_status.setText("地图、任务、速度或性能参数已改变；该历史轨迹不适用当前条件")
+                return
+            if self._gl.replay_navigation_path(path, item.get('trajectory')):
                 algo_name = str(item.get("algorithm", "Unknown"))
                 run_no = int(item.get("run", 0))
                 self.trace_status.setText(f"正在回放第 {run_no} 次运行 ({algo_name})")
@@ -763,13 +771,13 @@ class ThreeDWindow(QMainWindow):
             control.setEnabled(False)
             return control
         self.max_speed_limit = performance_control(12, " m/s")
-        self.cruise_speed = performance_control(5, " m/s")
+        self.cruise_speed = performance_control(12, " m/s")
         self.longitudinal_accel = performance_control(2, " m/s²")
         self.lateral_accel = performance_control(8, " m/s²")
         self.climb_rate = performance_control(2, " m/s")
         self.turn_penalty = performance_control(0.15, "", True)
         self.close_turn_penalty = performance_control(0.30, "", True)
-        performance_fields = [("最大速度", self.max_speed_limit), ("巡航速度 v", self.cruise_speed),
+        performance_fields = [("最大速度", self.max_speed_limit), ("期望直线速度", self.cruise_speed),
                               ("纵向加速度", self.longitudinal_accel), ("横向加速度", self.lateral_accel),
                               ("爬升/下降速率", self.climb_rate), ("转弯惩罚", self.turn_penalty),
                               ("近距离转弯惩罚", self.close_turn_penalty)]
@@ -809,13 +817,13 @@ class ThreeDWindow(QMainWindow):
             for _, control in performance_fields:
                 control.setEnabled(enabled)
             self.navigate_speed.setEnabled(not enabled)
-            self.navigate_speed.setToolTip("性能约束开启时，回放使用巡航速度及启动加速度" if enabled else "地图单位/秒")
+            self.navigate_speed.setToolTip("性能约束开启时，采用包含加减速动作的变速轨迹" if enabled else "地图单位/秒")
             if config is None:
                 self.feasibility_status.setText("性能约束关闭；回放速度采用地图单位 u/s")
             else:
                 try:
                     config.validate()
-                    self.feasibility_status.setText(f"r=v²/a横={config.turn_radius:.3f} m；规划与训练使用膨胀地图和爬升限制；参数变化需重新训练。voxel_size 按米解释。")
+                    self.feasibility_status.setText(f"参考半径 v最大²/a横={config.turn_radius:.3f} m；原地图规划、直连简化、自适应圆弧与变速；参数变化需重新训练。voxel_size 按米解释。")
                 except ValueError as exc:
                     self.feasibility_status.setText(str(exc))
             update_navigation_ui()
@@ -1098,7 +1106,6 @@ class ThreeDWindow(QMainWindow):
         left_layout.addWidget(edit_bar)
         left_layout.addWidget(edit_trace_separator)
         left_layout.addWidget(trace_bar)
-        left_layout.addWidget(metrics_bar)
         left_layout.addStretch(1)
 
         self.controls_scroll = QScrollArea()
@@ -1109,7 +1116,12 @@ class ThreeDWindow(QMainWindow):
         self.controls_scroll.setMaximumWidth(480)
         self.controls_scroll.setWidget(left_panel)
         main_layout.addWidget(self.controls_scroll, stretch=0)
-        main_layout.addWidget(self._gl, stretch=1)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self._gl, stretch=1)
+        right_layout.addWidget(metrics_bar)
+        main_layout.addWidget(right_panel, stretch=1)
 
         self.setCentralWidget(root)
 

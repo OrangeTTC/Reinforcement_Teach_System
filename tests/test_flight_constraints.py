@@ -11,7 +11,7 @@ from algorithm.algorithm_a_star import plan_astar_path_map_xyz
 from algorithm.algorithm_entrypoints import PATH_ENTRYPOINTS, TRAIN_ENTRYPOINTS
 from algorithm.flight_constraints import (
     FlightConstraints, build_flight_policy_path, build_flight_trajectory,
-    inflate_obstacles, map_scale, plan_flight_astar, prepare_flight_grid,
+    map_scale, plan_flight_astar, prepare_flight_grid,
     segment_free, turn_cost,
 )
 
@@ -27,20 +27,21 @@ class FlightConstraintTests(unittest.TestCase):
         self.config = FlightConstraints(cruise_speed=2, lateral_accel=2, climb_rate=1)
 
     def test_parameter_validation_and_radius(self) -> None:
-        self.assertEqual(self.config.turn_radius, 2)
+        self.assertEqual(self.config.turn_radius, 72)
         for cfg in (replace(self.config, cruise_speed=13), replace(self.config, lateral_accel=0),
                     replace(self.config, climb_rate=float('nan')), replace(self.config, turn_penalty=-1)):
             with self.assertRaises(ValueError):
                 cfg.validate()
 
-    def test_startup_acceleration_and_cruise_are_frame_rate_independent(self) -> None:
-        cfg = replace(self.config, cruise_speed=6, longitudinal_accel=2)
-        self.assertEqual(cfg.distance_at_time(1), 1)
-        self.assertEqual(cfg.distance_at_time(3), 9)
-        self.assertEqual(cfg.distance_at_time(5), 21)
-        self.assertEqual(cfg.speed_at_time(2), 4)
-        self.assertEqual(cfg.speed_at_time(99), 6)
-        self.assertEqual(cfg.distance_at_time(-1), 0)
+    def test_acceleration_braking_and_duration_are_analytic(self) -> None:
+        cfg = replace(self.config, max_speed=6, cruise_speed=6, longitudinal_accel=2)
+        t = build_flight_trajectory([(0,0,50),(100,0,50)],self.occ,1,cfg)
+        self.assertAlmostEqual(t.distance_at_time(1), 1)
+        self.assertAlmostEqual(t.speed_at_time(1), 2)
+        self.assertAlmostEqual(t.duration, 40/6+3, places=8)
+        self.assertAlmostEqual(t.distance_at_time(t.duration), 40)
+        self.assertAlmostEqual(t.speed_at_time(t.duration), 0)
+        self.assertAlmostEqual(t.distance_at_time(-1), 0)
 
     def test_non_cubic_grid_physical_conversion_and_arc_length(self) -> None:
         occ = np.zeros((101, 51, 21), dtype=np.uint8)
@@ -48,47 +49,33 @@ class FlightConstraintTests(unittest.TestCase):
         self.assertAlmostEqual(build_flight_trajectory([(0,0,50),(100,0,50)], occ, 2, self.config).length, 200)
         path = [(10,10,50),(50,10,50),(50,60,50)]
         self.occ[12,20,14] = 1  # Block the diagonal without obstructing the two legs.
-        t = build_flight_trajectory(path, self.occ, 1, self.config)
+        t = build_flight_trajectory(path, self.occ, 1, replace(self.config,max_speed=2))
         expected = 16 + 20 - 4 + math.pi
         self.assertAlmostEqual(t.length, expected, places=8)
         arc = next(s for s in t.segments if s.center is not None)
-        self.assertAlmostEqual(arc.radius, self.config.turn_radius)
-        self.assertAlmostEqual(arc.length, self.config.turn_radius * math.pi / 2)
+        self.assertAlmostEqual(arc.radius, 2)
+        self.assertAlmostEqual(arc.length, 2 * math.pi / 2)
         np.testing.assert_allclose(t.position_map(t.length), path[-1], atol=1e-8)
         # Playback samples from the exact circle, not its chord.
         halfway = arc.position(arc.length / 2)
         self.assertAlmostEqual(np.linalg.norm(halfway - np.asarray(arc.center)), 2)
 
-    def test_inflation_is_physical_and_preserves_source(self) -> None:
-        occ = np.zeros((15,15,15), dtype=np.uint8)
-        occ[7,7,7] = 1
-        original = occ.copy()
-        small, large = inflate_obstacles(occ, 2, 1), inflate_obstacles(occ, 4, 1)
-        self.assertGreater(large.sum(), small.sum())
-        self.assertEqual(inflate_obstacles(occ, 4, 2).sum(), small.sum())
-        self.assertTrue(small[9,7,7])
-        self.assertFalse(small[11,7,7])
-        np.testing.assert_array_equal(occ, original)
-
-    def test_inflated_corridor_is_rejected_during_search(self) -> None:
+    def test_narrow_straight_corridor_is_not_dilated(self) -> None:
         occ = np.ones((21,21,21), dtype=np.uint8)
         occ[:,9:12,9:12] = 0
-        # Ordinary point A* passes, but r=2 consumes this narrow corridor.
-        start, end = (0,50,50), (100,50,50)
-        plain = plan_astar_path_map_xyz(start,end,occ,21,21,None,mapper)
-        self.assertTrue(plain)
-        with self.assertRaisesRegex(ValueError, '膨胀'):
-            plan_flight_astar(start,end,occ,1,self.config)
+        original=occ.copy()
+        t=plan_flight_astar((0,50,50),(100,50,50),occ,1,self.config)
+        self.assertAlmostEqual(t.length,20)
+        np.testing.assert_array_equal(occ,original)
+        np.testing.assert_array_equal(prepare_flight_grid(occ,1,self.config).occupancy,occ)
 
-    def test_climb_limit_changes_search_not_just_playback(self) -> None:
-        grid = prepare_flight_grid(self.occ, 1, replace(self.config, climb_rate=.4))
-        self.assertTrue(any(max(abs(v) for v in a) > 1 for a in grid.actions))
-        for a in grid.actions:
-            self.assertLessEqual(abs(a[1]) / math.sqrt(sum(v*v for v in a)), .2 + 1e-8)
-        t = plan_flight_astar((10,10,50),(90,90,60),self.occ,1,replace(self.config, climb_rate=.4))
-        self.assertTrue(t.segments)
-        with self.assertRaises(ValueError):
-            build_flight_trajectory([(50,50,20),(50,50,90)],self.occ,1,self.config)
+    def test_climb_speed_adjusts_even_for_vertical_edges(self) -> None:
+        cfg=replace(self.config,climb_rate=.4)
+        grid=prepare_flight_grid(self.occ,1,cfg)
+        self.assertEqual(len(grid.actions),26)
+        t=build_flight_trajectory([(50,50,20),(50,50,90)],self.occ,1,cfg)
+        self.assertLessEqual(t.speed_profile.speeds.max(),.4+1e-8)
+        self.assertAlmostEqual(t.length,28)
 
     def test_distinct_exact_endpoints_in_same_voxel_are_preserved(self) -> None:
         start, end = (50,50,50), (50.5,50,50)
@@ -112,13 +99,15 @@ class FlightConstraintTests(unittest.TestCase):
         self.assertFalse(segment_free(np.array([0,5.5,5]), np.array([10,5.5,5]),occ,1))
         self.assertTrue(segment_free(np.array([0,6,5]), np.array([10,6,5]),occ,1))
 
-    def test_tight_adjacent_corners_never_shrink_required_radius(self) -> None:
-        # Place walls so the tempting direct shortcut is forbidden.
+    def test_tight_adjacent_corners_reduce_radius_and_speed(self) -> None:
         occ = np.zeros((41,41,41),dtype=np.uint8)
         occ[12,20,5] = occ[28,20,5] = 1
         path = [(10,10,50),(50,10,50),(50,15,50),(90,15,50)]
-        with self.assertRaisesRegex(ValueError, '转角过近'):
-            build_flight_trajectory(path,occ,1,self.config)
+        t=build_flight_trajectory(path,occ,1,self.config)
+        arcs=[s for s in t.segments if s.center is not None]
+        self.assertEqual(len(arcs),2)
+        self.assertTrue(all(s.radius < self.config.turn_radius for s in arcs))
+        self.assertGreater(t.duration,0)
 
     def test_astar_obstacle_detour_is_rounded_and_collision_free(self) -> None:
         self.occ[18:23,:27,17:24] = 1
@@ -127,7 +116,7 @@ class FlightConstraintTests(unittest.TestCase):
         arcs = [s for s in t.segments if s.center is not None]
         self.assertTrue(arcs)
         for arc in arcs:
-            self.assertAlmostEqual(cfg.cruise_speed ** 2 / arc.radius, cfg.lateral_accel)
+            self.assertLessEqual(arc.radius,cfg.turn_radius+1e-8)
         sampled = np.asarray(t.samples_map()) * t.scale
         for a,b in zip(sampled[:-1],sampled[1:]):
             self.assertTrue(segment_free(a,b,self.occ,1))
@@ -151,9 +140,10 @@ class FlightConstraintTests(unittest.TestCase):
                 self.assertTrue(ok,msg)
                 self.assertEqual(model.flight_constraints,cfg)
                 self.assertIsNotNone(model.flight_valid_moves)
+                self.assertEqual(model.speed_controller.algorithm,name)
                 path = PATH_ENTRYPOINTS[name](model,start,end,mapper)
                 self.assertGreaterEqual(len(path),2)
-                t = build_flight_trajectory(path,occ,1,cfg)
+                t = build_flight_trajectory(path,occ,1,cfg,speed_controller=model.speed_controller)
                 self.assertGreater(t.length,0)
                 np.testing.assert_allclose(t.position_map(t.length),end)
 

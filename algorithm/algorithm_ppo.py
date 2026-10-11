@@ -12,6 +12,7 @@ from typing import Callable
 
 from algorithm.algorithm_q_learning import train_q_learning_full_map
 from algorithm.flight_constraints import FlightConstraints, build_flight_policy_path, copy_flight_context
+from algorithm.flight_speed_control import train_speed_controller
 
 
 @dataclass
@@ -39,6 +40,7 @@ class PPOModel:
     flight_constraints: FlightConstraints | None = None
     flight_voxel_size: float = 1.0
     flight_valid_moves: object = None
+    speed_controller: object = None
 
 
 def _clamp_0_100(v: float) -> float:
@@ -414,6 +416,8 @@ def train_ppo_full_map(
     model.value = dense_value
 
     copy_flight_context(model, teacher_model)
+    if flight_constraints is not None:
+        model.speed_controller = train_speed_controller('PPO', flight_constraints)
     if progress_callback is not None:
         progress_callback(100)
 

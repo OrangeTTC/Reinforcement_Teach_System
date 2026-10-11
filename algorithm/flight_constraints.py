@@ -21,13 +21,13 @@ GridPoint = tuple[int, int, int]
 class FlightConstraints:
     """SI units; voxel_size is interpreted as metres per voxel.
 
-    Cruise speed is maintained after the initial longitudinal acceleration.
+    Cruise speed is a preferred straight-line ceiling, not a constant speed.
     Climb_rate limits the magnitude of both ascent and descent velocity.
     Penalties are deliberately small, soft preferences during policy extraction.
     """
 
     max_speed: float = 12.0
-    cruise_speed: float = 5.0
+    cruise_speed: float = 12.0
     longitudinal_accel: float = 2.0
     lateral_accel: float = 8.0
     climb_rate: float = 2.0
@@ -40,26 +40,14 @@ class FlightConstraints:
         if not all(math.isfinite(v) and v > 0 for v in values):
             raise ValueError("速度、加速度和爬升速率必须为有限正数")
         if self.cruise_speed > self.max_speed:
-            raise ValueError("巡航速度不能超过飞机最大速度")
+            raise ValueError("期望直线速度不能超过飞机最大速度")
         if not all(math.isfinite(v) and v >= 0 for v in (self.turn_penalty, self.close_turn_penalty)):
             raise ValueError("转弯惩罚必须为有限非负数")
 
     @property
     def turn_radius(self) -> float:
-        return self.cruise_speed ** 2 / self.lateral_accel
+        return self.max_speed ** 2 / self.lateral_accel
 
-    @property
-    def vertical_fraction(self) -> float:
-        return min(1.0, self.climb_rate / self.cruise_speed)
-
-    def distance_at_time(self, elapsed: float) -> float:
-        t = max(0.0, elapsed)
-        ramp = self.cruise_speed / self.longitudinal_accel
-        return (0.5 * self.longitudinal_accel * t * t if t < ramp
-                else self.cruise_speed * (t - 0.5 * ramp))
-
-    def speed_at_time(self, elapsed: float) -> float:
-        return min(self.cruise_speed, self.longitudinal_accel * max(0.0, elapsed))
 
 
 def map_scale(shape: tuple[int, ...], voxel_size: float) -> np.ndarray:
@@ -75,34 +63,6 @@ def _points(path: list[MapPoint]) -> np.ndarray:
     if (np.linalg.norm(np.diff(p, axis=0), axis=1) < 1e-10).any():
         raise ValueError("路径包含重复点")
     return p
-
-
-def inflate_obstacles(occupancy: np.ndarray, radius: float, voxel_size: float) -> np.ndarray:
-    """Conservative Euclidean dilation, covering the closed source voxel cubes.
-
-    A truncated, separable squared-distance transform uses NumPy only. The
-    half-voxel diagonal accounts for cube surfaces rather than point obstacles.
-    The original occupancy is never changed, and endpoints are never cleared.
-    """
-    occ = np.asarray(occupancy)
-    map_scale(occ.shape, voxel_size)
-    if not math.isfinite(radius) or radius < 0:
-        raise ValueError("膨胀半径无效")
-    if radius == 0 or not occ.any():
-        return (occ != 0).astype(np.uint8)
-    reach = radius / voxel_size + math.sqrt(3) / 2
-    dist = np.where(occ != 0, 0.0, np.inf)
-    for axis, n in enumerate(occ.shape):
-        source = dist
-        target = source.copy()
-        for offset in range(1, min(n, int(math.ceil(reach)) + 1)):
-            lo, hi = [slice(None)] * 3, [slice(None)] * 3
-            lo[axis], hi[axis] = slice(0, n - offset), slice(offset, n)
-            lo, hi = tuple(lo), tuple(hi)
-            np.minimum(target[lo], source[hi] + offset * offset, out=target[lo])
-            np.minimum(target[hi], source[lo] + offset * offset, out=target[hi])
-        dist = target
-    return (dist <= reach * reach + 1e-9).astype(np.uint8)
 
 
 def segment_free(a: np.ndarray, b: np.ndarray, occupancy: np.ndarray,
@@ -181,19 +141,12 @@ class FlightGrid:
 def prepare_flight_grid(occupancy: np.ndarray, voxel_size: float,
                         constraints: FlightConstraints) -> FlightGrid:
     constraints.validate()
-    occ = inflate_obstacles(occupancy, constraints.turn_radius, voxel_size)
-    fraction = constraints.vertical_fraction
-    candidates = {(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1)
-                  for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0)}
-    # Sub-voxel climb slopes need longer horizontal moves; otherwise a 26-only
-    # graph would incorrectly make every ascent unreachable at low climb rates.
-    if fraction < 1:
-        run = math.sqrt(max(0, 1 / fraction ** 2 - 1))
-        for x, z in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
-            k = max(1, int(math.ceil(run / math.hypot(x, z) - 1e-10)))
-            if abs(x * k) < occ.shape[0] and abs(z * k) < occ.shape[2]:
-                candidates.update((x * k, y, z * k) for y in (-1, 1))
-    actions = tuple(sorted(a for a in candidates if abs(a[1]) / math.sqrt(sum(v*v for v in a)) <= fraction + 1e-10))
+    map_scale(occupancy.shape, voxel_size)
+    occ = (np.asarray(occupancy) != 0).astype(np.uint8)
+    # Speed is adjustable: even a vertical edge is feasible at a lower speed.
+    # Geometry is searched on the original 26-neighbour map, without dilation.
+    actions = tuple((x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1)
+                    for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0))
     free = occ == 0
     masks = []
     for action in actions:
@@ -327,6 +280,7 @@ class FlightTrajectory:
     scale: np.ndarray
     polyline_map: list[MapPoint]
     constraints: FlightConstraints
+    speed_profile: Any = None
 
     @property
     def length(self) -> float:
@@ -348,10 +302,15 @@ class FlightTrajectory:
                           for i in range(1, count + 1))
         return result
 
+    @property
+    def duration(self) -> float:
+        return self.speed_profile.duration
 
-def _climb_ok(a: np.ndarray, b: np.ndarray, config: FlightConstraints) -> bool:
-    length = np.linalg.norm(b - a)
-    return length > 1e-10 and abs(b[2] - a[2]) / length <= config.vertical_fraction + 1e-10
+    def distance_at_time(self, elapsed: float) -> float:
+        return self.speed_profile.distance_at_time(elapsed)
+
+    def speed_at_time(self, elapsed: float) -> float:
+        return self.speed_profile.speed_at_time(elapsed)
 
 
 def _simplify(points: np.ndarray, occ: np.ndarray, size: float, config: FlightConstraints,
@@ -368,14 +327,15 @@ def _simplify(points: np.ndarray, occ: np.ndarray, size: float, config: FlightCo
     kept, i = [points[0]], 0
     while i < len(points) - 1:
         j = len(points) - 1
-        while j > i + 1 and not (_climb_ok(points[i], points[j], config) and segment_free(points[i], points[j], occ, size)):
+        while j > i + 1 and not segment_free(points[i], points[j], occ, size):
             j -= 1
         kept.append(points[j])
         i = j
     return np.asarray(kept)
 
 
-def _arc_segments(points: np.ndarray, config: FlightConstraints) -> list[TrajectorySegment]:
+def _arc_segments(points: np.ndarray, config: FlightConstraints,
+                  occupancy: np.ndarray, size: float) -> list[TrajectorySegment]:
     vectors = np.diff(points, axis=0)
     lengths = np.linalg.norm(vectors, axis=1)
     dirs = vectors / lengths[:, None]
@@ -384,11 +344,15 @@ def _arc_segments(points: np.ndarray, config: FlightConstraints) -> list[Traject
     for i in range(1, len(points) - 1):
         angle = math.acos(float(np.clip(np.dot(dirs[i-1], dirs[i]), -1, 1)))
         if angle > math.pi - 1e-7:
-            raise ValueError("路径包含掉头，无法按巡航转弯半径构造圆弧")
+            raise ValueError("路径包含掉头，无法构造相切圆弧")
         if angle > 1e-7:
             angles[i], trims[i] = angle, config.turn_radius * math.tan(angle / 2)
-    if (trims[:-1] + trims[1:] > lengths + 1e-8).any():
-        raise ValueError("相邻转角过近或端点距转角过近，无法容纳规定半径圆弧；请降低巡航速度或调整起终点")
+    # Allocate tangent lengths between neighbouring corners. Reducing radius
+    # is permitted here; the speed profile enforces v²/r <= a_lateral later.
+    for i, length in enumerate(lengths):
+        total = trims[i] + trims[i+1]
+        if total > length:
+            trims[i:i+2] *= length / total
     segments = []
     def straight(a, b):
         length = float(np.linalg.norm(b - a))
@@ -399,19 +363,35 @@ def _arc_segments(points: np.ndarray, config: FlightConstraints) -> list[Traject
         if angles[i] == 0:
             continue
         u, v, theta = dirs[i-1], dirs[i], angles[i]
-        entry, exit = points[i] - u * trims[i], points[i] + v * trims[i]
         q = (v - math.cos(theta) * u) / math.sin(theta)
-        center = entry + q * config.turn_radius
-        # Exact maximum vertical tangent component, including interior extrema.
-        extrema = [0.0, theta]
-        root = math.atan2(q[2], u[2])
-        extrema.extend(root + k * math.pi for k in range(-2, 3) if 0 <= root + k * math.pi <= theta)
-        peak = max(abs(u[2] * math.cos(t) + q[2] * math.sin(t)) for t in extrema)
-        if peak > config.vertical_fraction + 1e-9:
-            raise ValueError("圆弧内爬升/下降速率超过飞机性能")
+        def candidate(trim: float) -> TrajectorySegment:
+            radius = trim / math.tan(theta / 2)
+            a, b = points[i] - u * trim, points[i] + v * trim
+            return TrajectorySegment(tuple(a), tuple(b), radius * theta,
+                                     tuple(a + q * radius), tuple(u), theta, radius)
+        cap = min(config.turn_radius * math.tan(theta / 2),
+                  lengths[i-1] - trims[i-1], lengths[i] - trims[i+1])
+        # A visible shortcut can hug a wall. Certify the entire arc, and search
+        # downwards when the preferred radius intersects a closed obstacle.
+        try:
+            _check_segments([candidate(cap)], occupancy, size, config)
+        except ValueError:
+            low, high = 0.0, cap
+            for _ in range(32):
+                mid = (low + high) / 2
+                try:
+                    _check_segments([candidate(mid)], occupancy, size, config)
+                    low = mid
+                except ValueError:
+                    high = mid
+            cap = low * (1 - 1e-7)
+        if cap <= max(1e-10, size * 1e-8):
+            raise ValueError("转角附近没有可认证的无碰撞圆弧空间")
+        trims[i] = cap
+        arc = candidate(cap)
+        entry, exit = np.asarray(arc.start), np.asarray(arc.end)
         straight(cursor, entry)
-        segments.append(TrajectorySegment(tuple(entry), tuple(exit), config.turn_radius * theta,
-                                          tuple(center), tuple(u), theta, config.turn_radius))
+        segments.append(arc)
         cursor = exit
     straight(cursor, points[-1])
     return segments
@@ -421,8 +401,6 @@ def _check_segments(segments: list[TrajectorySegment], occupancy: np.ndarray,
                     size: float, config: FlightConstraints) -> None:
     for s in segments:
         if s.center is None:
-            if not _climb_ok(np.asarray(s.start), np.asarray(s.end), config):
-                raise ValueError("直线段爬升/下降速率超过飞机性能")
             count, margin = 1, 0.0
         else:
             # Inflate obstacles by the exact chord sagitta to conservatively
@@ -447,7 +425,8 @@ def _check_segments(segments: list[TrajectorySegment], occupancy: np.ndarray,
 
 
 def build_flight_trajectory(path: list[MapPoint], occupancy: np.ndarray, voxel_size: float,
-                            constraints: FlightConstraints, grid: FlightGrid | None = None) -> FlightTrajectory:
+                            constraints: FlightConstraints, grid: FlightGrid | None = None,
+                            speed_controller: Any = None) -> FlightTrajectory:
     constraints.validate()
     scale = map_scale(occupancy.shape, voxel_size)
     physical = _points(path) * scale
@@ -456,9 +435,12 @@ def build_flight_trajectory(path: list[MapPoint], occupancy: np.ndarray, voxel_s
     for shortcuts in (True, False):
         points = _simplify(physical, grid.occupancy, voxel_size, constraints, shortcuts)
         try:
-            segments = _arc_segments(points, constraints)
+            segments = _arc_segments(points, constraints, occupancy, voxel_size)
             _check_segments(segments, occupancy, voxel_size, constraints)
-            return FlightTrajectory(segments, scale, [tuple(float(v) for v in p / scale) for p in points], constraints)
+            trajectory = FlightTrajectory(segments, scale, [tuple(float(v) for v in p / scale) for p in points], constraints)
+            from algorithm.flight_speed_control import build_speed_profile
+            trajectory.speed_profile = build_speed_profile(trajectory, speed_controller)
+            return trajectory
         except ValueError as exc:
             error = str(exc)
     raise ValueError(error)
@@ -469,12 +451,12 @@ def plan_flight_astar(start_xyz: MapPoint, end_xyz: MapPoint, occupancy: np.ndar
     grid = prepare_flight_grid(occupancy, voxel_size, constraints)
     start, goal = grid_index(start_xyz, grid.occupancy.shape), grid_index(end_xyz, grid.occupancy.shape)
     if grid.occupancy[start] or grid.occupancy[goal]:
-        raise ValueError("起点或终点落在按转弯半径膨胀的障碍中；请调整位置或性能参数")
+        raise ValueError("起点或终点落在原地图的障碍中；请调整位置")
     if start == goal and math.dist(start_xyz, end_xyz) > 1e-8:
         return build_flight_trajectory([start_xyz, end_xyz], occupancy, voxel_size, constraints, grid)
     nodes, _ = _grid_search(grid, start, goal)
     if len(nodes) < 2:
-        raise ValueError("A* 在膨胀地图和爬升限制下未找到可通行路径")
+        raise ValueError("A* 在原始地图上未找到无碰撞路径")
     path = [grid_to_map(n, grid.occupancy.shape) for n in nodes]
     if math.dist(start_xyz, path[0]) > 1e-8:
         path.insert(0, start_xyz)
@@ -486,11 +468,11 @@ def plan_flight_astar(start_xyz: MapPoint, end_xyz: MapPoint, occupancy: np.ndar
 def build_flight_teacher(occupancy: np.ndarray, end_xyz: MapPoint, voxel_size: float,
                          constraints: FlightConstraints, gamma: float, alpha: float,
                          progress_callback: Callable[[int], None] | None) -> dict[str, Any]:
-    """Full-map targets on the same inflated, climb-limited action graph."""
+    """Full-map position targets on the original collision-checked grid."""
     grid = prepare_flight_grid(occupancy, voxel_size, constraints)
     goal = grid_index(end_xyz, grid.occupancy.shape)
     if grid.occupancy[goal]:
-        raise ValueError("终点位于按转弯半径膨胀的障碍中")
+        raise ValueError("终点位于原地图的障碍中")
     _, dist = _grid_search(grid, goal, goal, progress_callback, full_distance=True)
     values = np.full(dist.shape, -1e9)
     finite = np.isfinite(dist)
@@ -503,11 +485,13 @@ def build_flight_teacher(occupancy: np.ndarray, end_xyz: MapPoint, voxel_size: f
         is_goal[goal] = True
         reward = np.where(_shift(is_goal, delta, False), 260.0, -cost / voxel_size)
         q[..., a] = np.where(grid.valid_moves[a], reward + alpha * gamma * future, -1e9)
+    from algorithm.flight_speed_control import train_speed_controller
     return dict(q_table=q, policy=np.argmax(q, axis=3).astype(np.int8),
                 free_mask=grid.occupancy == 0, goal_idx=goal, grid_shape=dist.shape,
                 is_3d=True, actions=grid.actions, distance_map=dist,
                 flight_constraints=constraints, flight_voxel_size=voxel_size,
-                flight_valid_moves=grid.valid_moves)
+                flight_valid_moves=grid.valid_moves,
+                speed_controller=train_speed_controller('Q-learning', constraints))
 
 
 def build_flight_policy_path(model: Any, start_xyz: MapPoint, end_xyz: MapPoint,
@@ -559,5 +543,5 @@ def build_flight_policy_path(model: Any, start_xyz: MapPoint, end_xyz: MapPoint,
 
 def copy_flight_context(model: Any, teacher: Any) -> None:
     """Keep the teacher's feasible graph attached to distilled models."""
-    for field in ('flight_constraints', 'flight_voxel_size', 'flight_valid_moves'):
+    for field in ('flight_constraints', 'flight_voxel_size', 'flight_valid_moves', 'speed_controller'):
         setattr(model, field, getattr(teacher, field))

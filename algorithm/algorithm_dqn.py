@@ -12,6 +12,7 @@ from typing import Callable
 
 from algorithm.algorithm_q_learning import QLearningModel, train_q_learning_full_map
 from algorithm.flight_constraints import FlightConstraints, build_flight_policy_path, copy_flight_context
+from algorithm.flight_speed_control import train_speed_controller
 
 
 @dataclass
@@ -33,6 +34,7 @@ class DQNModel:
     flight_constraints: FlightConstraints | None = None
     flight_voxel_size: float = 1.0
     flight_valid_moves: object = None
+    speed_controller: object = None
 
 
 def _relu(x):
@@ -280,8 +282,9 @@ def train_dqn_full_map(
         err = (y_pred - y_true).astype(np.float32)
         scale = float(1.0 / max(1, batch))
 
-        # MSE gradients.
-        dy = 2.0 * err * scale
+        # Huber gradients averaged over states and actions avoid exploding
+        # regression when many of the 26 actions have masked negative targets.
+        dy = np.clip(err, -10.0, 10.0) * scale / n_actions
         gw3 = h2.T @ dy
         gb3 = np.sum(dy, axis=0, keepdims=True)
 
@@ -343,6 +346,8 @@ def train_dqn_full_map(
     )
 
     copy_flight_context(model, teacher_model)
+    if flight_constraints is not None:
+        model.speed_controller = train_speed_controller('DQN', flight_constraints)
     if progress_callback is not None:
         progress_callback(100)
 

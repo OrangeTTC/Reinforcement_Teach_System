@@ -31,6 +31,7 @@ class QLearningModel:
     flight_constraints: FlightConstraints | None = None
     flight_voxel_size: float = 1.0
     flight_valid_moves: object = None
+    speed_controller: object = None
 
 
 def _actions_3d_26() -> tuple[tuple[int, int, int], ...]:

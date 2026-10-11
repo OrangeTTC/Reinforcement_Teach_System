@@ -572,18 +572,42 @@ class RotatingCubeWidget(QOpenGLWidget):
         """Store unsampled corner geometry so replay can reconstruct true arcs."""
         return list(self._last_plan_polyline)
 
+    def get_last_flight_trajectory(self) -> FlightTrajectory | None:
+        return self._flight_trajectory
+
+    def get_last_navigation_duration(self) -> float:
+        """Motion time in seconds, independent of path-computation time."""
+        if self._flight_trajectory is not None:
+            return self._flight_trajectory.duration
+        return self._nav_total_dist / self._nav_speed_units_per_sec
+
     def get_navigation_comparison_key(self) -> tuple:
         c = self._flight_constraints
-        return ('u',) if c is None else ('m', c.max_speed, c.cruise_speed, c.longitudinal_accel,
-                                       c.lateral_accel, c.climb_rate, c.turn_penalty, c.close_turn_penalty)
+        return ('u', self._planning_revision, self._nav_speed_units_per_sec) if c is None else (
+            'm', self._planning_revision, c.max_speed, c.cruise_speed, c.longitudinal_accel,
+            c.lateral_accel, c.climb_rate, c.turn_penalty, c.close_turn_penalty)
 
-    def replay_navigation_path(self, path: list[tuple[float, float, float]]) -> bool:
+    def replay_navigation_path(self, path: list[tuple[float, float, float]],
+                               trajectory: FlightTrajectory | None = None) -> bool:
         """Replay a previously recorded map-space path."""
 
         if not path or len(path) < 2:
             return False
+        if trajectory is not None:
+            from algorithm.flight_constraints import _check_segments, map_scale
+            import numpy as np
+            try:
+                if self._occupancy is None or trajectory.constraints != self._flight_constraints:
+                    raise ValueError("历史轨迹的地图或性能条件不匹配")
+                if not np.allclose(trajectory.scale, map_scale(self._occupancy.shape, self._cell_size)):
+                    raise ValueError("历史轨迹的地图尺寸不匹配")
+                _check_segments(trajectory.segments, self._occupancy, self._cell_size, trajectory.constraints)
+            except ValueError as exc:
+                self._last_feasibility_message = str(exc)
+                self.feasibility_changed.emit(str(exc))
+                return False
         # Copy path to avoid accidental external mutation during playback.
-        return self._set_navigation_path(list(path))
+        return self._set_navigation_path(list(path), trajectory)
 
     def _path_length(self, planned: list[tuple[float, float, float]]) -> float:
         if not planned or len(planned) < 2:
@@ -734,7 +758,8 @@ class RotatingCubeWidget(QOpenGLWidget):
         return (ok, msg)
 
     def _set_navigation_path(self, planned: list[tuple[float, float, float]],
-                             trajectory: FlightTrajectory | None = None) -> bool:
+                             trajectory: FlightTrajectory | None = None,
+                             speed_controller: object = None) -> bool:
         self.stop_navigation()
         self._last_feasibility_message = ""
         self._nav_path_map_xyz = []
@@ -748,7 +773,9 @@ class RotatingCubeWidget(QOpenGLWidget):
             try:
                 if self._occupancy is None:
                     raise ValueError("性能约束需要三维体素地图")
-                trajectory = trajectory or build_flight_trajectory(planned, self._occupancy, self._cell_size, self._flight_constraints)
+                trajectory = trajectory or build_flight_trajectory(
+                    planned, self._occupancy, self._cell_size, self._flight_constraints,
+                    speed_controller=speed_controller)
             except ValueError as exc:
                 self._last_feasibility_message = str(exc)
                 self.feasibility_changed.emit(str(exc))
@@ -757,7 +784,7 @@ class RotatingCubeWidget(QOpenGLWidget):
             self._flight_trajectory = trajectory
             self._last_plan_polyline = list(trajectory.polyline_map)
             planned = trajectory.samples_map()
-            self._last_feasibility_message = f"性能约束已参与规划：r={self._flight_constraints.turn_radius:.3f} m，圆弧轨迹长={trajectory.length:.3f} m"
+            self._last_feasibility_message = f"原地图规划与自适应圆弧：参考半径={self._flight_constraints.turn_radius:.3f} m，轨迹长={trajectory.length:.3f} m，运行时间={trajectory.duration:.3f} s"
             self.feasibility_changed.emit(self._last_feasibility_message)
         else:
             self._last_plan_polyline = list(planned)
@@ -812,7 +839,7 @@ class RotatingCubeWidget(QOpenGLWidget):
         if not planned or len(planned) < 2:
             return (False, f"{algo} 导航失败：路径优化后不足两个有效路径点")
 
-        ok = self._set_navigation_path(planned)
+        ok = self._set_navigation_path(planned, speed_controller=getattr(model, 'speed_controller', None))
         if not ok:
             return (False, f"{algo} 导航失败：{self._last_feasibility_message or '导航路径写入播放器失败'}")
 
@@ -899,7 +926,7 @@ class RotatingCubeWidget(QOpenGLWidget):
 
         self._nav_elapsed_s += dt
         if self._flight_trajectory is not None:
-            self._nav_progress_dist = self._flight_trajectory.constraints.distance_at_time(self._nav_elapsed_s)
+            self._nav_progress_dist = self._flight_trajectory.distance_at_time(self._nav_elapsed_s)
         else:
             self._nav_progress_dist += float(self._nav_speed_units_per_sec) * dt
         if self._nav_progress_dist >= self._nav_total_dist:

@@ -97,6 +97,44 @@ class FlightUIIntegrationTests(unittest.TestCase):
                 window.deleteLater()
                 self.app.processEvents()
 
+    def test_results_record_motion_time_and_replay_exact_speed_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings=QSettings(str(Path(folder)/'settings.ini'),QSettings.IniFormat)
+            with patch('map.map_qt_3d_view.QSettings',return_value=settings):
+                window=ThreeDWindow()
+            try:
+                gl=window._gl
+                gl._occupancy=self.widget._occupancy.copy()
+                gl._occ_nx=gl._occ_ny=gl._occ_nz=41
+                window.constraints_checkbox.setChecked(True)
+                for edit,value in zip([window.sx_edit,window.sy_edit,window.sz_edit,
+                                       window.ex_edit,window.ey_edit,window.ez_edit],
+                                      [10,50,35,90,50,35]):
+                    edit.setText(str(value))
+                window.set_trace_button.click()
+                window.algo_combo.setCurrentText('Q-learning')
+                window.train_algo_button.click()
+                window.navigate_button.click()
+                self.assertEqual(window.metrics_table.columnCount(),7)
+                self.assertEqual(len(window._metrics_history),1)
+                record=window._metrics_history[0]
+                trajectory=record['trajectory']
+                self.assertAlmostEqual(record['flight_time'],trajectory.duration)
+                self.assertEqual(window.metrics_table.item(0,6).text(),f'{trajectory.duration:.3f}')
+                window.metrics_table.cellClicked.emit(0,0)
+                self.assertIs(gl.get_last_flight_trajectory(),trajectory)
+                np.testing.assert_allclose(gl._flight_trajectory.speed_profile.speeds,trajectory.speed_profile.speeds)
+                window.cruise_speed.setValue(4)
+                window.metrics_table.cellClicked.emit(0,0)
+                self.assertIn('已改变',window.trace_status.text())
+                self.assertFalse(gl.replay_navigation_path(record['planning_path'],trajectory))
+                self.assertIn('不匹配',gl.get_last_feasibility_message())
+            finally:
+                window._gl.stop_navigation()
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()
